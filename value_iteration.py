@@ -25,7 +25,9 @@ class ValueIterationAgent:
                 v_old = self.V[s]
                 self.V[s] = max([self.calc_action_value(s, a) for a in range(self.env.action_space.n)])
                 max_diff = max(max_diff, abs(v_old - self.V[s]))
-                iterations += 1
+            
+            iterations += 1
+
             if max_diff < config.THETA_CONVERGENCE:
                 break
         return iterations

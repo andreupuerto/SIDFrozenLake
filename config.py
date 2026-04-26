@@ -10,11 +10,11 @@ SEED = 99 # semilla fija del mapa para las pruebas
 # --- 2. REWARD SHAPING ---
 DEFAULT_REWARD = False
 HOLE_PENALTY = -0.5
-STEP_PENALTY = -0.01
+STEP_PENALTY = 0.0
 GOAL_REWARD = 1.0
 
 # --- 3. HIPERPARÁMETROS GENERALES ---
-GAMMA = 0.95 # factor descuento
+GAMMA = 0.99 # factor descuento
 T_MAX = 100 # maximo de pasos por episodio
 NUM_EPISODES = 2000 # numero de pruebas para entrenar al agente
 
@@ -26,7 +26,7 @@ EPSILON_MIN = 0.01 # valor minimo exploracion
 
 THETA_CONVERGENCE = 1e-6 # umbral de convergencia diferencia de valor
 
-REINFORCE_LR = 0.01 # learning rate del reinforce
+REINFORCE_LR = 0.1 # learning rate del reinforce
 
 NUM_EPISODES_TEST = 100 # tests finales que se hacen para comparar los algoritmos
 REWARD_THRESHOLD = 0.9 # umbral para considerar el problema resuelto
