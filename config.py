@@ -1,4 +1,4 @@
-# config.py
+# config.py aqui las variables para poder cambiar los parametros
 import numpy as np
 
 # --- 1. CONFIGURACIÓN DEL ENTORNO ---

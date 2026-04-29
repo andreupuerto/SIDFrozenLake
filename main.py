@@ -1,6 +1,9 @@
 import config
-from environment import create_env
+import time
 import numpy as np
+import matplotlib.pyplot as plt
+from environment import create_env
+from value_iteration import ValueIterationAgent
 from reinforce import ReinforceAgent
 
 def evaluate_agent(agent, env, num_episodes=None):
@@ -31,28 +34,51 @@ def evaluate_agent(agent, env, num_episodes=None):
     
     return success_rate, avg_reward
 
+def plot_learning(history, name):
+    plt.figure(figsize=(10, 5))
+    plt.plot(history, alpha=0.3, color='blue', label="Recompensa")
+    if len(history) > 100:
+        smooth = np.convolve(history, np.ones(100)/100, mode='valid')
+        plt.plot(smooth, color='red', label="Media móvil (100 ep.)")
+    plt.title(f"Progreso de Entrenamiento - {name} ({config.MAP_NAME})")
+    plt.xlabel("Episodios")
+    plt.ylabel("Recompensa Total")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
 if __name__ == "__main__":
-    import time
-    from value_iteration import ValueIterationAgent # Importamos tu clase
-
-    print(f"--- Iniciando Experimento: {config.MAP_NAME} (Slippery={config.SLIPPERY}) ---")
+    print("\n" + "="*35)
+    print("   SISTEMA DE CONTROL DE AGENTES")
+    print("="*35)
+    print(f"Config: Mapa {config.MAP_NAME} | Slippery={config.SLIPPERY}")
+    print("-" * 35)
+    print("1. Value Iteration (Model-Based)")
+    print("2. REINFORCE (Policy Gradient)")
     
-    env = create_env(render_mode=None)
+    opcion = input("\nSelecciona el algoritmo a ejecutar: ")
 
-    #AGENTES (se tendra que añadir un metodo para elegir)
-    # agent = ValueIterationAgent(env)
-    agent = ReinforceAgent(env)
+    env = create_env()
     
-    print("Entrenando agente (Cálculo de utilidades)...")
+    if opcion == '1':
+        agent = ValueIterationAgent(env)
+    else:
+        agent = ReinforceAgent(env)
+
+    print(f"\nEntrenando {agent.__class__.__name__}...")
     start_time = time.time()
-    iterations = agent.train()
+    resultado = agent.train()
     end_time = time.time()
-    
-    training_time = end_time - start_time
-    print(f"Convergencia alcanzada en {iterations} iteraciones.")
-    print(f"Tiempo de cómputo: {training_time:.4f} segundos.")
 
-    print(f"Evaluando política en {config.NUM_EPISODES_TEST} episodios...")
+    print(f"Entrenamiento completado en {end_time - start_time:.2f} segundos.")
+
+    if isinstance(resultado, list):
+        plot_learning(resultado, agent.__class__.__name__)
+    else:
+        print(f"Convergencia alcanzada en {resultado} iteraciones.")
+
+    print(f"\nEvaluando en {config.NUM_EPISODES_TEST} episodios...")
+
     success_rate, avg_reward = evaluate_agent(agent, env)
 
     print("\n" + "="*30)
