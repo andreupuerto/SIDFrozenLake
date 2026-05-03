@@ -1,4 +1,4 @@
-# main.py  — ejecución interactiva de un único agente
+# main.py para probar los agentes
 import time
 import config
 from environment import create_env

@@ -1,11 +1,10 @@
-# experiments.py — batería completa de experimentos
-#
-# Uso:
-#   python experiments.py                  # corre todos los experimentos
-#   python experiments.py --exp 1          # solo el experimento 1
-#   python experiments.py --exp 3 --save   # exp 3 y guarda gráficas en results/
-#
-
+"""
+Módulo experiments.py
+Este script ejecuta diferentes experimentos para evaluar y comparar el
+rendimiento de varios agentes de Reinforcement Learning bajo distintas
+condiciones (tamaño de mapa, tasa de éxito, etc.).
+Genera gráficas y guarda los resultados en archivos CSV.
+"""
 import argparse
 import csv
 import os
@@ -38,11 +37,19 @@ ACTIVE_AGENTS = [
     # "Model Based",   # [PENDING]
 ]
 
-# Solo estos agentes tienen num_episodes como hiperparámetro relevante
 EPISODE_DEPENDENT = {"REINFORCE", "Q-Learning"}
 
-
 def build_agent(name, env):
+    """
+    Instancia y devuelve el agente correspondiente según su nombre.
+
+    Args:
+        name (str): Nombre del agente a crear.
+        env: Entorno de Gymnasium que el agente usará.
+
+    Returns:
+        Un objeto de la clase del agente correspondiente.
+    """
     if name == "Value Iteration":
         return ValueIterationAgent(env)
     elif name == "REINFORCE":
@@ -56,37 +63,75 @@ def build_agent(name, env):
 
 
 def train_agent(agent):
+    """
+    Entrena un agente midiendo cuánto tiempo tarda.
+
+    Args:
+        agent: El agente que se va a entrenar.
+
+    Returns:
+        tuple: (history, elapsed_time)
+            - history (list): Lista con el historial de recompensas durante el entrenamiento.
+            - elapsed_time (float): Tiempo en segundos que ha tardado en entrenar.
+    """
     start = time.time()
     resultado = agent.train()
     elapsed = time.time() - start
+    
+    # Nos aseguramos de devolver una lista incluso si el agente no devuelve historial
     history = resultado if isinstance(resultado, list) else []
     return history, elapsed
 
 
 def run_agents(agents_to_run, map_name, success_rate, gamma, num_episodes, save, label):
+    """
+    Ejecuta el entrenamiento y evaluación de una lista de agentes
+    bajo una configuración específica.
+
+    Args:
+        agents_to_run (list): Lista de nombres de los agentes a ejecutar.
+        map_name (str): Nombre del mapa ("4x4", "8x8").
+        success_rate (float): Probabilidad de que el entorno ejecute la acción deseada (estocasticidad).
+        gamma (float): Factor de descuento.
+        num_episodes (int): Número de episodios de entrenamiento.
+        save (bool): Si es True, guarda gráficas y añade datos al CSV.
+        label (str): Etiqueta para nombrar los archivos guardados.
+
+    Returns:
+        tuple: (results, histories) diccionarios con resultados y curvas de aprendizaje de cada agente.
+    """
+    # Actualizamos la configuración global para que los agentes la usen
     config.GAMMA = gamma
     config.NUM_EPISODES = num_episodes
 
+    # Creamos el entorno con las características indicadas
     env = create_env(map_name=map_name, success_rate=success_rate)
+    
     results = {}
     histories = {}
 
+    # Entrenamos y evaluamos cada agente de forma secuencial
     for name in agents_to_run:
         print(f"    [{name}] entrenando...", end=" ", flush=True)
+        
         agent = build_agent(name, env)
         history, elapsed = train_agent(agent)
+        
+        # Después de entrenar, evaluamos el rendimiento final
         pct, avg_r = evaluate_agent(agent, env)
         print(f"éxito={pct:.1f}% | reward={avg_r:.4f} | tiempo={elapsed:.2f}s")
 
         results[name] = {"success": pct, "avg_reward": avg_r, "time": elapsed}
         histories[name] = history
 
+        # Guardamos los resultados de este agente en el archivo CSV si se pide
         if save:
             _append_csv(label, map_name, success_rate, gamma, num_episodes,
                         name, pct, avg_r, elapsed)
 
     env.close()
 
+    # Generamos los gráficos de resultados para esta ejecución conjunta
     if save:
         _plot_bars(results, f"% Éxito — {label}", f"{label}_success.png")
         _plot_times(results, f"Tiempo — {label}", f"{label}_time.png")
@@ -142,7 +187,6 @@ def exp2_success_rate(save=False):
 
 
 def exp3_combined(save=False):
-    """Experimento 3: Combinado mapa x estocasticidad. Todos los algoritmos."""
     print("\n" + "=" * 55)
     print("EXPERIMENTO 3 — Combinado: mapa + estocasticidad")
     print("=" * 55)
@@ -166,7 +210,6 @@ def exp3_combined(save=False):
 
 
 def exp4_gamma(save=False):
-    """Experimento 4: Efecto de gamma. Mapa 4x4. Todos los algoritmos."""
     print("\n" + "=" * 55)
     print("EXPERIMENTO 4 — Efecto de gamma")
     print("=" * 55)
@@ -191,10 +234,6 @@ def exp4_gamma(save=False):
 
 
 def exp5_episodes(save=False):
-    """
-    Experimento 5: Efecto del número de episodios.
-    Solo Q-Learning y REINFORCE (agentes episódicos).
-    """
     print("\n" + "=" * 55)
     print("EXPERIMENTO 5 — Número de episodios (agentes episódicos)")
     print("=" * 55)
@@ -229,8 +268,6 @@ def exp5_episodes(save=False):
 
     return all_results
 
-
-# ── Gráficas ──────────────────────────────────────────────────────────────────
 
 COLORS = ["steelblue", "seagreen", "tomato", "mediumpurple", "darkorange"]
 
@@ -348,8 +385,6 @@ def _plot_combined_heatmap(all_results, combos, title, filename):
     plt.close()
 
 
-# ── CSV ───────────────────────────────────────────────────────────────────────
-
 def _init_csv():
     with open(CSV_PATH, "w", newline="") as f:
         writer = csv.writer(f)
@@ -364,8 +399,6 @@ def _append_csv(exp, map_name, sr, gamma, num_ep, agent, pct, avg_r, elapsed):
         writer.writerow([exp, map_name, sr, gamma, num_ep, agent,
                          f"{pct:.2f}", f"{avg_r:.4f}", f"{elapsed:.2f}"])
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Experimentos FrozenLake")

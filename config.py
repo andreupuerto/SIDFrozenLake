@@ -20,6 +20,8 @@ NUM_EPISODES = 2000 # numero de pruebas para entrenar al agente
 
 LEARNING_RATE = 0.1 # tasa de aprendizaje (parametro alfa)
 LR_DECAY = 0.999 # descuento de la tasa de aprendizaje
+
+# QLEARNING
 EPSILON = 0.2 # exploracion inicial
 EPSILON_DECAY = 0.995 # descuento epsilon
 EPSILON_MIN = 0.01 # valor minimo exploracion
