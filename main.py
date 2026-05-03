@@ -1,90 +1,74 @@
-import config
+# main.py  — ejecución interactiva de un único agente
 import time
-import numpy as np
-import matplotlib.pyplot as plt
+import config
 from environment import create_env
+from utils import evaluate_agent, plot_learning
 from value_iteration import ValueIterationAgent
 from reinforce import ReinforceAgent
 
-def evaluate_agent(agent, env, num_episodes=None):
-    episodes = num_episodes if num_episodes else config.NUM_EPISODES_TEST
-    successes = 0
-    total_rewards = []
+def build_agent(name, env):
+    if name == "value_iteration":
+        return ValueIterationAgent(env)
+    elif name == "reinforce":
+        return ReinforceAgent(env)
+    # elif name == "qlearning":
+    #     return QLearningAgent(env)
+    # elif name == "model_based":
+    #     return ModelBasedAgent(env)
+    else:
+        raise ValueError(f"Agente desconocido: {name}")
 
-    for _ in range(episodes):
-        state, _ = env.reset()
-        done = False
-        truncated = False
-        ep_reward = 0
-        steps = 0
 
-        while not (done or truncated) and steps < config.T_MAX:
-            action = agent.select_action(state, training=False)
-            state, reward, done, truncated, _ = env.step(action)
-            ep_reward += reward
-            steps += 1
-            
-            if done and reward >= 1.0:
-                successes += 1
-        
-        total_rewards.append(ep_reward)
+def interactive_config():
+    print("\n--- CONFIGURACIÓN ---")
 
-    success_rate = (successes / episodes) * 100
-    avg_reward = np.mean(total_rewards)
-    
-    return success_rate, avg_reward
+    mapa = input(f"Mapa (4x4/8x8) [actual: {config.MAP_NAME}]: ").strip()
+    if mapa in ["4x4", "8x8"]:
+        config.MAP_NAME = mapa
 
-def plot_learning(history, name):
-    plt.figure(figsize=(10, 5))
-    plt.plot(history, alpha=0.3, color='blue', label="Recompensa")
-    if len(history) > 100:
-        smooth = np.convolve(history, np.ones(100)/100, mode='valid')
-        plt.plot(smooth, color='red', label="Media móvil (100 ep.)")
-    plt.title(f"Progreso de Entrenamiento - {name} ({config.MAP_NAME})")
-    plt.xlabel("Episodios")
-    plt.ylabel("Recompensa Total")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    sr = input(f"Success rate 0-1 [actual: {config.SUCCESS_RATE}]: ").strip()
+    try:
+        config.SUCCESS_RATE = float(sr)
+    except ValueError:
+        pass
+
+    ep = input(f"Número de episodios [actual: {config.NUM_EPISODES}]: ").strip()
+    if ep.isdigit():
+        config.NUM_EPISODES = int(ep)
+
 
 if __name__ == "__main__":
-    print("\n" + "="*35)
-    print("   SISTEMA DE CONTROL DE AGENTES")
-    print("="*35)
-    print(f"Config: Mapa {config.MAP_NAME} | Slippery={config.SLIPPERY}")
-    print("-" * 35)
-    print("1. Value Iteration (Model-Based)")
-    print("2. REINFORCE (Policy Gradient)")
-    
-    opcion = input("\nSelecciona el algoritmo a ejecutar: ")
+    interactive_config()
+
+    print("\n" + "=" * 40)
+    print(f" Mapa: {config.MAP_NAME} | Success rate: {config.SUCCESS_RATE}")
+    print("=" * 40)
+    print("1. Value Iteration")
+    print("2. REINFORCE")
+    print("3. Q-Learning")
+    print("4. Model Based")
+
+    opciones = {"1": "value_iteration", "2": "reinforce", "3": "qlearning", "4": "model_based"}
+    opcion = input("\nSelecciona algoritmo: ").strip()
+
+    if opcion not in opciones:
+        print("Opción no válida.")
+        exit(1)
 
     env = create_env()
-    
-    if opcion == '1':
-        agent = ValueIterationAgent(env)
-    else:
-        agent = ReinforceAgent(env)
+    agent = build_agent(opciones[opcion], env)
 
     print(f"\nEntrenando {agent.__class__.__name__}...")
-    start_time = time.time()
+    start = time.time()
     resultado = agent.train()
-    end_time = time.time()
-
-    print(f"Entrenamiento completado en {end_time - start_time:.2f} segundos.")
+    elapsed = time.time() - start
+    print(f"Entrenamiento completado en {elapsed:.2f}s")
 
     if isinstance(resultado, list):
-        plot_learning(resultado, agent.__class__.__name__)
+        plot_learning(resultado, agent.__class__.__name__, config.MAP_NAME)
     else:
-        print(f"Convergencia alcanzada en {resultado} iteraciones.")
-
-    print(f"\nEvaluando en {config.NUM_EPISODES_TEST} episodios...")
+        print(f"Convergencia en {resultado} iteraciones.")
 
     success_rate, avg_reward = evaluate_agent(agent, env)
-
-    print("\n" + "="*30)
-    print(f"RESULTADOS FINALES - {config.MAP_NAME}")
-    print(f"Porcentaje de éxito: {success_rate:.2f}%")
-    print(f"Recompensa promedio: {avg_reward:.4f}")
-    print("="*30)
-
+    print(f"\nÉxito: {success_rate:.2f}% | Recompensa media: {avg_reward:.4f}")
     env.close()

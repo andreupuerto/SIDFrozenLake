@@ -1,2 +1,3 @@
-# SIDFrozenLake
+# FrozenLake RL — Práctica 2
+
 
