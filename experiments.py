@@ -1,10 +1,12 @@
-"""
-Módulo experiments.py
-Este script ejecuta diferentes experimentos para evaluar y comparar el
-rendimiento de varios agentes de Reinforcement Learning bajo distintas
-condiciones (tamaño de mapa, tasa de éxito, etc.).
-Genera gráficas y guarda los resultados en archivos CSV.
-"""
+# experiments.py — batería completa de experimentos
+#
+# Uso:
+#   python experiments.py --exp calibration_gamma     # calibración gamma
+#   python experiments.py --exp calibration_episodes  # calibración episodios
+#   python experiments.py --exp main                  # experimento principal
+#   python experiments.py --exp all                   # todos
+#   python experiments.py --exp all --save            # todos + guarda resultados
+
 import argparse
 import csv
 import os
@@ -18,38 +20,41 @@ from environment import create_env
 from utils import evaluate_agent
 from value_iteration import ValueIterationAgent
 from reinforce import ReinforceAgent
-
 # [PENDING] from qlearning import QLearningAgent
 # [PENDING] from model_based import ModelBasedAgent
 
+# ── Directorios ───────────────────────────────────────────────────────────────
 RESULTS_DIR = "results"
 PLOTS_DIR = os.path.join(RESULTS_DIR, "plots")
 CSV_PATH = os.path.join(RESULTS_DIR, "results.csv")
+
+COLORS = {
+    "Value Iteration": "steelblue",
+    "REINFORCE":       "tomato",
+    "Q-Learning":      "seagreen",
+    "Model Based":     "mediumpurple",
+}
+
+# ── Agentes activos ───────────────────────────────────────────────────────────
+# Descomenta cuando tus compañeros entreguen sus ficheros
+ACTIVE_AGENTS = [
+    "Value Iteration",
+    "REINFORCE",
+    # "Q-Learning",  # [PENDING]
+    # "Model Based", # [PENDING]
+]
+
+# Solo estos tienen num_episodes como hiperparámetro relevante
+EPISODE_DEPENDENT = {"REINFORCE", "Q-Learning"}
 
 
 def setup_dirs():
     os.makedirs(PLOTS_DIR, exist_ok=True)
 
-ACTIVE_AGENTS = [
-    "Value Iteration",
-    "REINFORCE",
-    # "Q-Learning",    # [PENDING]
-    # "Model Based",   # [PENDING]
-]
 
-EPISODE_DEPENDENT = {"REINFORCE", "Q-Learning"}
+# ── Construcción de agentes ───────────────────────────────────────────────────
 
 def build_agent(name, env):
-    """
-    Instancia y devuelve el agente correspondiente según su nombre.
-
-    Args:
-        name (str): Nombre del agente a crear.
-        env: Entorno de Gymnasium que el agente usará.
-
-    Returns:
-        Un objeto de la clase del agente correspondiente.
-    """
     if name == "Value Iteration":
         return ValueIterationAgent(env)
     elif name == "REINFORCE":
@@ -62,156 +67,56 @@ def build_agent(name, env):
         raise ValueError(f"Agente desconocido: {name}")
 
 
+# ── Entrenamiento y evaluación ────────────────────────────────────────────────
+
 def train_agent(agent):
-    """
-    Entrena un agente midiendo cuánto tiempo tarda.
-
-    Args:
-        agent: El agente que se va a entrenar.
-
-    Returns:
-        tuple: (history, elapsed_time)
-            - history (list): Lista con el historial de recompensas durante el entrenamiento.
-            - elapsed_time (float): Tiempo en segundos que ha tardado en entrenar.
-    """
     start = time.time()
     resultado = agent.train()
     elapsed = time.time() - start
-    
-    # Nos aseguramos de devolver una lista incluso si el agente no devuelve historial
     history = resultado if isinstance(resultado, list) else []
     return history, elapsed
 
 
 def run_agents(agents_to_run, map_name, success_rate, gamma, num_episodes, save, label):
-    """
-    Ejecuta el entrenamiento y evaluación de una lista de agentes
-    bajo una configuración específica.
-
-    Args:
-        agents_to_run (list): Lista de nombres de los agentes a ejecutar.
-        map_name (str): Nombre del mapa ("4x4", "8x8").
-        success_rate (float): Probabilidad de que el entorno ejecute la acción deseada (estocasticidad).
-        gamma (float): Factor de descuento.
-        num_episodes (int): Número de episodios de entrenamiento.
-        save (bool): Si es True, guarda gráficas y añade datos al CSV.
-        label (str): Etiqueta para nombrar los archivos guardados.
-
-    Returns:
-        tuple: (results, histories) diccionarios con resultados y curvas de aprendizaje de cada agente.
-    """
-    # Actualizamos la configuración global para que los agentes la usen
+    """Entrena y evalúa cada agente con la configuración dada."""
     config.GAMMA = gamma
     config.NUM_EPISODES = num_episodes
 
-    # Creamos el entorno con las características indicadas
     env = create_env(map_name=map_name, success_rate=success_rate)
-    
     results = {}
     histories = {}
 
-    # Entrenamos y evaluamos cada agente de forma secuencial
     for name in agents_to_run:
         print(f"    [{name}] entrenando...", end=" ", flush=True)
-        
         agent = build_agent(name, env)
         history, elapsed = train_agent(agent)
-        
-        # Después de entrenar, evaluamos el rendimiento final
         pct, avg_r = evaluate_agent(agent, env)
         print(f"éxito={pct:.1f}% | reward={avg_r:.4f} | tiempo={elapsed:.2f}s")
 
         results[name] = {"success": pct, "avg_reward": avg_r, "time": elapsed}
         histories[name] = history
 
-        # Guardamos los resultados de este agente en el archivo CSV si se pide
         if save:
-            _append_csv(label, map_name, success_rate, gamma, num_episodes,
-                        name, pct, avg_r, elapsed)
+            _append_csv(label, map_name, success_rate, gamma,
+                        num_episodes, name, pct, avg_r, elapsed)
 
     env.close()
-
-    # Generamos los gráficos de resultados para esta ejecución conjunta
-    if save:
-        _plot_bars(results, f"% Éxito — {label}", f"{label}_success.png")
-        _plot_times(results, f"Tiempo — {label}", f"{label}_time.png")
-        _plot_curves(histories, f"Curvas — {label}", f"{label}_curves.png")
-
     return results, histories
 
 
-def exp1_map_size(save=False):
+# ── EXPERIMENTOS DE CALIBRACIÓN ───────────────────────────────────────────────
+
+def calibration_gamma(save=False):
+    """
+    Exp A — Calibración de gamma.
+    Fija: 4x4, SR=0.8, ep=config.NUM_EPISODES
+    Varía: gamma = 0.90, 0.95, 0.99
+    Objetivo: justificar el valor de gamma usado en el experimento principal.
+    Hipótesis: gamma alto funciona mejor porque la meta está lejos y
+               las rutas óptimas son largas.
+    """
     print("\n" + "=" * 55)
-    print("EXPERIMENTO 1 — Tamaño del mapa")
-    print("=" * 55)
-
-    maps = ["4x4", "8x8"]
-    sr = 0.8
-    gamma = config.GAMMA
-    num_ep = config.NUM_EPISODES
-
-    all_results = {}
-    for m in maps:
-        print(f"\n  Mapa={m} | SR={sr} | γ={gamma} | ep={num_ep}")
-        res, _ = run_agents(ACTIVE_AGENTS, m, sr, gamma, num_ep, save, f"exp1_map{m}")
-        all_results[m] = res
-
-    if save:
-        _plot_map_comparison(all_results, maps,
-                             "Exp1: % Éxito por tamaño de mapa", "exp1_comparison.png")
-    return all_results
-
-
-def exp2_success_rate(save=False):
-    print("\n" + "=" * 55)
-    print("EXPERIMENTO 2 — Efecto del success_rate")
-    print("=" * 55)
-
-    success_rates = [0.33, 0.5, 0.8, 1.0]
-    map_name = "4x4"
-    gamma = config.GAMMA
-    num_ep = config.NUM_EPISODES
-
-    all_results = {}
-    for sr in success_rates:
-        print(f"\n  Mapa={map_name} | SR={sr} | γ={gamma} | ep={num_ep}")
-        res, _ = run_agents(ACTIVE_AGENTS, map_name, sr, gamma, num_ep,
-                            save, f"exp2_sr{sr}")
-        all_results[sr] = res
-
-    if save:
-        _plot_line_comparison(all_results, success_rates, "Success Rate",
-                              "Exp2: % Éxito vs Success Rate (4x4)",
-                              "exp2_sr_comparison.png")
-    return all_results
-
-
-def exp3_combined(save=False):
-    print("\n" + "=" * 55)
-    print("EXPERIMENTO 3 — Combinado: mapa + estocasticidad")
-    print("=" * 55)
-
-    combos = [("4x4", 0.33), ("4x4", 0.8), ("8x8", 0.33), ("8x8", 0.8)]
-    gamma = config.GAMMA
-    num_ep = config.NUM_EPISODES
-
-    all_results = {}
-    for map_name, sr in combos:
-        print(f"\n  Mapa={map_name} | SR={sr} | γ={gamma} | ep={num_ep}")
-        label = f"exp3_map{map_name}_sr{sr}"
-        res, _ = run_agents(ACTIVE_AGENTS, map_name, sr, gamma, num_ep, save, label)
-        all_results[(map_name, sr)] = res
-
-    if save:
-        _plot_combined_heatmap(all_results, combos,
-                               "Exp3: % Éxito (mapa x estocasticidad)",
-                               "exp3_combined.png")
-    return all_results
-
-
-def exp4_gamma(save=False):
-    print("\n" + "=" * 55)
-    print("EXPERIMENTO 4 — Efecto de gamma")
+    print("CALIBRACIÓN A — Efecto de gamma")
     print("=" * 55)
 
     gammas = [0.90, 0.95, 0.99]
@@ -221,21 +126,34 @@ def exp4_gamma(save=False):
 
     all_results = {}
     for g in gammas:
-        print(f"\n  Mapa={map_name} | SR={sr} | γ={g} | ep={num_ep}")
+        print(f"\n  γ={g} | Mapa={map_name} | SR={sr} | ep={num_ep}")
         res, _ = run_agents(ACTIVE_AGENTS, map_name, sr, g, num_ep,
-                            save, f"exp4_g{g}")
+                            save, f"calA_g{g}")
         all_results[g] = res
 
     if save:
-        _plot_line_comparison(all_results, gammas, "Gamma (γ)",
-                              "Exp4: % Éxito vs Gamma",
-                              "exp4_gamma_comparison.png")
+        _plot_line(all_results, gammas, "Gamma (γ)",
+                   "Calibración A: % Éxito vs Gamma",
+                   "calA_gamma.png")
+        _plot_time_line(all_results, gammas, "Gamma (γ)",
+                        "Calibración A: Tiempo vs Gamma",
+                        "calA_gamma_time.png")
+
+    print("\n→ Usa el gamma con mayor % éxito en el experimento principal.")
     return all_results
 
 
-def exp5_episodes(save=False):
+def calibration_episodes(save=False):
+    """
+    Exp B — Calibración de número de episodios.
+    Solo Q-Learning y REINFORCE (agentes episódicos).
+    Fija: 4x4, SR=0.8, gamma=config.GAMMA
+    Varía: episodios = 500, 1000, 2000, 5000
+    Objetivo: encontrar el número mínimo de episodios con el que convergen.
+    Hipótesis: Q-Learning converge antes que REINFORCE por menor varianza.
+    """
     print("\n" + "=" * 55)
-    print("EXPERIMENTO 5 — Número de episodios (agentes episódicos)")
+    print("CALIBRACIÓN B — Número de episodios (agentes episódicos)")
     print("=" * 55)
 
     episode_counts = [500, 1000, 2000, 5000]
@@ -245,59 +163,130 @@ def exp5_episodes(save=False):
 
     episodic_active = [a for a in ACTIVE_AGENTS if a in EPISODE_DEPENDENT]
     if not episodic_active:
-        print("  (ningún agente episódico activo — añade Q-Learning o REINFORCE)")
+        print("  (ningún agente episódico activo todavía — añade Q-Learning o REINFORCE)")
         return {}
 
     all_results = {}
     all_histories = {}
     for num_ep in episode_counts:
-        print(f"\n  Mapa={map_name} | SR={sr} | γ={gamma} | ep={num_ep}")
+        print(f"\n  ep={num_ep} | Mapa={map_name} | SR={sr} | γ={gamma}")
         res, hist = run_agents(episodic_active, map_name, sr, gamma, num_ep,
-                               save, f"exp5_ep{num_ep}")
+                               save, f"calB_ep{num_ep}")
         all_results[num_ep] = res
         all_histories[num_ep] = hist
 
     if save:
-        _plot_line_comparison(all_results, episode_counts, "Nº episodios",
-                              "Exp5: % Éxito vs Nº episodios",
-                              "exp5_episodes_comparison.png")
-        # Curvas de aprendizaje para el mayor número de episodios
+        _plot_line(all_results, episode_counts, "Nº episodios",
+                   "Calibración B: % Éxito vs Episodios",
+                   "calB_episodes.png")
+        # Curvas de aprendizaje con el máximo de episodios
         _plot_curves(all_histories[episode_counts[-1]],
-                     f"Exp5: Curvas con {episode_counts[-1]} episodios",
-                     f"exp5_curves_{episode_counts[-1]}ep.png")
+                     f"Calibración B: Curvas ({episode_counts[-1]} ep.)",
+                     f"calB_curves_{episode_counts[-1]}ep.png")
 
+    print("\n→ Usa el mínimo de episodios donde la curva ya se estabiliza.")
     return all_results
 
 
-COLORS = ["steelblue", "seagreen", "tomato", "mediumpurple", "darkorange"]
+# ── EXPERIMENTO PRINCIPAL ─────────────────────────────────────────────────────
+
+def main_experiment(save=False):
+    """
+    Experimento principal — Mapa x Success Rate x Algoritmo.
+    Fija: gamma y num_episodes justificados por la calibración.
+    Varía: mapa (4x4, 8x8) x SR (0.33, 0.66, 1.0)
+
+    Esto da una matriz completa de resultados que permite:
+    - Ver cómo afecta SR para cada tamaño de mapa
+    - Ver cómo escala cada algoritmo con el mapa
+    - Identificar qué algoritmo es más robusto en cada escenario
+
+    Hipótesis:
+    - Value Iteration: óptimo en 4x4 pero escala mal en 8x8
+    - Model Based: similar a VI pero más lento por la estimación
+    - Q-Learning: escala mejor pero necesita más episodios en 8x8
+    - REINFORCE: el más lento en converger, más afectado por SR bajo
+    - SR bajo afecta más a los agentes que aprenden de experiencia (QL, REINFORCE, MB)
+      que a VI que lee el MDP real
+    """
+    print("\n" + "=" * 55)
+    print("EXPERIMENTO PRINCIPAL — Mapa x Success Rate x Algoritmo")
+    print("=" * 55)
+
+    maps = ["4x4", "8x8"]
+    success_rates = [0.33, 0.66, 1.0]
+    gamma = config.GAMMA
+    num_ep = config.NUM_EPISODES
+
+    # Estructura: all_results[map_name][sr][agent_name]
+    all_results = {m: {} for m in maps}
+    all_histories = {m: {} for m in maps}
+
+    for map_name in maps:
+        for sr in success_rates:
+            print(f"\n  Mapa={map_name} | SR={sr} | γ={gamma} | ep={num_ep}")
+            label = f"main_map{map_name}_sr{sr}"
+            res, hist = run_agents(ACTIVE_AGENTS, map_name, sr, gamma,
+                                   num_ep, save, label)
+            all_results[map_name][sr] = res
+            all_histories[map_name][sr] = hist
+
+    if save:
+        # Gráfica por mapa: % éxito vs SR para cada algoritmo
+        for map_name in maps:
+            _plot_sr_per_map(all_results[map_name], success_rates,
+                             f"% Éxito vs SR — Mapa {map_name}",
+                             f"main_success_map{map_name}.png")
+            _plot_time_per_map(all_results[map_name], success_rates,
+                               f"Tiempo vs SR — Mapa {map_name}",
+                               f"main_time_map{map_name}.png")
+
+        # Gráfica comparativa 4x4 vs 8x8 para cada SR
+        for sr in success_rates:
+            _plot_map_comparison_bar(
+                {m: all_results[m][sr] for m in maps},
+                maps,
+                f"4x4 vs 8x8 con SR={sr}",
+                f"main_mapcomp_sr{sr}.png"
+            )
+
+        # Tabla resumen en CSV ya se guarda por run_agents
+        # Tabla resumen impresa en pantalla
+        _print_summary_table(all_results, maps, success_rates)
+
+    return all_results, all_histories
 
 
-def _plot_bars(results_by_agent, title, filename):
-    agents = list(results_by_agent.keys())
-    values = [results_by_agent[a]["success"] for a in agents]
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bars = ax.bar(agents, values, color=COLORS[:len(agents)])
+# ── GRÁFICAS ──────────────────────────────────────────────────────────────────
+
+def _plot_line(all_results, x_values, xlabel, title, filename):
+    agent_names = list(all_results[x_values[0]].keys())
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for agent in agent_names:
+        vals = [all_results[x][agent]["success"] for x in x_values]
+        ax.plot(x_values, vals, marker="o", label=agent, color=COLORS.get(agent))
     ax.set_title(title)
-    ax.set_ylabel("% Episodios exitosos")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("% Éxito")
     ax.set_ylim(0, 110)
-    for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
-                f"{val:.1f}%", ha="center", fontsize=9)
+    ax.legend()
+    ax.grid(True)
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, filename))
     plt.close()
 
 
-def _plot_times(results_by_agent, title, filename):
-    agents = list(results_by_agent.keys())
-    values = [results_by_agent[a]["time"] for a in agents]
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bars = ax.bar(agents, values, color=COLORS[:len(agents)])
+def _plot_time_line(all_results, x_values, xlabel, title, filename):
+    agent_names = list(all_results[x_values[0]].keys())
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for agent in agent_names:
+        vals = [all_results[x][agent]["time"] for x in x_values]
+        ax.plot(x_values, vals, marker="s", label=agent, color=COLORS.get(agent))
     ax.set_title(title)
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Tiempo (s)")
-    for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                f"{val:.2f}s", ha="center", fontsize=9)
+    ax.legend()
+    ax.grid(True)
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, filename))
     plt.close()
@@ -305,9 +294,10 @@ def _plot_times(results_by_agent, title, filename):
 
 def _plot_curves(histories_by_agent, title, filename):
     fig, ax = plt.subplots(figsize=(10, 5))
-    for (name, history), color in zip(histories_by_agent.items(), COLORS):
+    for name, history in histories_by_agent.items():
         if not history:
             continue
+        color = COLORS.get(name, "gray")
         ax.plot(history, alpha=0.2, color=color)
         if len(history) >= 100:
             smooth = np.convolve(history, np.ones(100) / 100, mode="valid")
@@ -324,36 +314,45 @@ def _plot_curves(histories_by_agent, title, filename):
     plt.close()
 
 
-def _plot_map_comparison(all_results, maps, title, filename):
-    agent_names = list(all_results[maps[0]].keys())
-    x = np.arange(len(agent_names))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for i, m in enumerate(maps):
-        vals = [all_results[m][a]["success"] for a in agent_names]
-        ax.bar(x + i * width, vals, width, label=f"Mapa {m}", color=COLORS[i])
-    ax.set_title(title)
-    ax.set_xticks(x + width / 2)
-    ax.set_xticklabels(agent_names)
-    ax.set_ylabel("% Éxito")
-    ax.set_ylim(0, 110)
-    ax.legend()
-    ax.grid(axis="y")
+def _plot_sr_per_map(results_by_sr, success_rates, title, filename):
+    """Líneas: un punto por SR, una línea por algoritmo."""
+    agent_names = list(results_by_sr[success_rates[0]].keys())
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(title)
+
+    for ax, metric, ylabel in zip(
+        axes,
+        ["success", "time"],
+        ["% Éxito", "Tiempo (s)"]
+    ):
+        for agent in agent_names:
+            vals = [results_by_sr[sr][agent][metric] for sr in success_rates]
+            ax.plot(success_rates, vals, marker="o",
+                    label=agent, color=COLORS.get(agent))
+        ax.set_xlabel("Success Rate")
+        ax.set_ylabel(ylabel)
+        ax.set_xticks(success_rates)
+        ax.legend()
+        ax.grid(True)
+        if metric == "success":
+            ax.set_ylim(0, 110)
+
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, filename))
     plt.close()
 
 
-def _plot_line_comparison(all_results, x_values, xlabel, title, filename):
-    agent_names = list(all_results[x_values[0]].keys())
+def _plot_time_per_map(results_by_sr, success_rates, title, filename):
+    agent_names = list(results_by_sr[success_rates[0]].keys())
     fig, ax = plt.subplots(figsize=(10, 5))
-    for agent, color in zip(agent_names, COLORS):
-        vals = [all_results[x][agent]["success"] for x in x_values]
-        ax.plot(x_values, vals, marker="o", label=agent, color=color)
+    for agent in agent_names:
+        vals = [results_by_sr[sr][agent]["time"] for sr in success_rates]
+        ax.plot(success_rates, vals, marker="s",
+                label=agent, color=COLORS.get(agent))
     ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("% Éxito")
-    ax.set_ylim(0, 110)
+    ax.set_xlabel("Success Rate")
+    ax.set_ylabel("Tiempo (s)")
+    ax.set_xticks(success_rates)
     ax.legend()
     ax.grid(True)
     plt.tight_layout()
@@ -361,29 +360,54 @@ def _plot_line_comparison(all_results, x_values, xlabel, title, filename):
     plt.close()
 
 
-def _plot_combined_heatmap(all_results, combos, title, filename):
-    agent_names = list(all_results[combos[0]].keys())
-    combo_labels = [f"{m}\nSR={sr}" for m, sr in combos]
+def _plot_map_comparison_bar(results_by_map, maps, title, filename):
+    """Barras agrupadas: 4x4 vs 8x8 por algoritmo."""
+    agent_names = list(results_by_map[maps[0]].keys())
+    x = np.arange(len(agent_names))
+    width = 0.35
 
-    fig, axes = plt.subplots(1, len(agent_names), figsize=(5 * len(agent_names), 5))
-    if len(agent_names) == 1:
-        axes = [axes]
-
-    for ax, agent in zip(axes, agent_names):
-        vals = [all_results[c][agent]["success"] for c in combos]
-        bars = ax.bar(combo_labels, vals, color=COLORS[:len(combos)])
-        ax.set_title(agent)
-        ax.set_ylabel("% Éxito")
-        ax.set_ylim(0, 110)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for i, m in enumerate(maps):
+        vals = [results_by_map[m][a]["success"] for a in agent_names]
+        bars = ax.bar(x + i * width, vals, width, label=f"Mapa {m}",
+                      alpha=0.8)
         for bar, val in zip(bars, vals):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
-                    f"{val:.1f}%", ha="center", fontsize=8)
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 1,
+                    f"{val:.0f}%", ha="center", fontsize=8)
 
-    fig.suptitle(title)
+    ax.set_title(title)
+    ax.set_xticks(x + width / 2)
+    ax.set_xticklabels(agent_names)
+    ax.set_ylabel("% Éxito")
+    ax.set_ylim(0, 115)
+    ax.legend()
+    ax.grid(axis="y")
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, filename))
     plt.close()
 
+
+def _print_summary_table(all_results, maps, success_rates):
+    """Imprime tabla resumen en consola."""
+    print("\n" + "=" * 70)
+    print("TABLA RESUMEN — % Éxito")
+    print("=" * 70)
+    agent_names = list(all_results[maps[0]][success_rates[0]].keys())
+    header = f"{'Mapa':<6} {'SR':<6} " + " ".join(f"{a:<18}" for a in agent_names)
+    print(header)
+    print("-" * 70)
+    for m in maps:
+        for sr in success_rates:
+            row = f"{m:<6} {sr:<6} "
+            for a in agent_names:
+                pct = all_results[m][sr][a]["success"]
+                row += f"{pct:<18.1f}"
+            print(row)
+    print("=" * 70)
+
+
+# ── CSV ───────────────────────────────────────────────────────────────────────
 
 def _init_csv():
     with open(CSV_PATH, "w", newline="") as f:
@@ -400,12 +424,22 @@ def _append_csv(exp, map_name, sr, gamma, num_ep, agent, pct, avg_r, elapsed):
                          f"{pct:.2f}", f"{avg_r:.4f}", f"{elapsed:.2f}"])
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Experimentos FrozenLake")
-    parser.add_argument("--exp", type=int, default=0,
-                        help="Experimento a ejecutar (1-5). 0 = todos.")
-    parser.add_argument("--save", action="store_true",
-                        help="Guarda gráficas y CSV en results/")
+    parser.add_argument(
+        "--exp",
+        type=str,
+        default="all",
+        choices=["all", "calibration_gamma", "calibration_episodes", "main"],
+        help="Experimento a ejecutar"
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Guarda gráficas y CSV en results/"
+    )
     return parser.parse_args()
 
 
@@ -417,20 +451,16 @@ if __name__ == "__main__":
         _init_csv()
 
     runners = {
-        1: exp1_map_size,
-        2: exp2_success_rate,
-        3: exp3_combined,
-        4: exp4_gamma,
-        5: exp5_episodes,
+        "calibration_gamma":     calibration_gamma,
+        "calibration_episodes":  calibration_episodes,
+        "main":                  main_experiment,
     }
 
-    if args.exp == 0:
+    if args.exp == "all":
         for fn in runners.values():
             fn(save=args.save)
-    elif args.exp in runners:
-        runners[args.exp](save=args.save)
     else:
-        print(f"Experimento {args.exp} no existe. Elige entre 1 y 5.")
+        runners[args.exp](save=args.save)
 
     if args.save:
         print(f"\nResultados en '{RESULTS_DIR}/' | CSV en '{CSV_PATH}'")
