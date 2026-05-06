@@ -8,8 +8,8 @@ from gymnasium import Wrapper
 import config
 from value_iteration import ValueIterationAgent
 from reinforce import ReinforceAgent
-# [PENDING] from qlearning import QLearningAgent
-# [PENDING] from model_based import ModelBasedAgent
+from qlearning import QLearningAgent
+from model_based import ModelBasedAgent
 
 
 # ── Entorno ───────────────────────────────────────────────────────────────────
@@ -87,10 +87,10 @@ def build_agent(name, env):
         return ValueIterationAgent(env)
     elif name == "reinforce":
         return ReinforceAgent(env)
-    # [PENDING] elif name == "qlearning":
-    #     return QLearningAgent(env)
-    # [PENDING] elif name == "model_based":
-    #     return ModelBasedAgent(env)
+    elif name == "qlearning":
+        return QLearningAgent(env)
+    elif name == "model_based":
+        return ModelBasedAgent(env)
     else:
         raise ValueError(f"Agente desconocido: {name}")
 
@@ -120,8 +120,8 @@ if __name__ == "__main__":
     print("=" * 40)
     print("1. Value Iteration")
     print("2. REINFORCE")
-    print("3. Q-Learning   [PENDING]")
-    print("4. Model Based  [PENDING]")
+    print("3. Q-Learning")
+    print("4. Model Based")
 
     opciones = {"1": "value_iteration", "2": "reinforce",
                 "3": "qlearning", "4": "model_based"}
