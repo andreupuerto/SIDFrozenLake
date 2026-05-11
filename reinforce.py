@@ -22,17 +22,18 @@ class ReinforceAgent:
         else:
             return np.argmax(probs)
 
+    def get_policy(self):
+        policy = np.zeros(self.env.observation_space.n, dtype=int)
+        for state in range(self.env.observation_space.n):
+            policy[state] = np.argmax(self._softmax(self.policy_logits[state]))
+        return policy
+
     def _compute_returns(self, rewards):
         returns = np.zeros(len(rewards))
         running_add = 0
         for t in reversed(range(len(rewards))):
             running_add = running_add * self.gamma + rewards[t]
             returns[t] = running_add
-
-        if len(returns) > 1:
-            std = np.std(returns)
-            if std > 1e-8:
-                returns = (returns - np.mean(returns)) / std
 
         return returns
 

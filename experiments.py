@@ -1,36 +1,61 @@
-# experiments.py — batería completa de experimentos
-#
-# Uso:
-#   python experiments.py --exp calibration_gamma
-#   python experiments.py --exp calibration_episodes
-#   python experiments.py --exp calibration_reward
-#   python experiments.py --exp calibration_epsilon
-#   python experiments.py --exp calibration_reinforce_lr
-#   python experiments.py --exp calibration_transitions
-#   python experiments.py --exp main
-#   python experiments.py --exp all --save
+# experiments.py
+# Changes: replaced the old single-CSV/one-seed experiment runner with the
+# dual-seed schema, per-run metrics, aggregation helpers, split CSV outputs,
+# calibration updates, scaling/stochasticity experiments, and sanity checks
+# required in Sections 3.1-3.10. The runner also consumes the new diagnostics
+# from main.py (Sections 2.2-2.4) and the Model-Based budget from config.py
+# (Section 4.1).
 
 import argparse
+import contextlib
 import csv
+import io
+import json
 import os
+import random
 import time
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 import config
-from main import create_env, evaluate_agent, build_agent
+from main import (
+    build_agent,
+    compute_state_action_coverage,
+    create_env,
+    evaluate_agent,
+    evaluate_agent_with_oracle,
+)
 
-# ── Directorios ───────────────────────────────────────────────────────────────
+
+# -- Directorios --------------------------------------------------------------
+
 RESULTS_DIR = "results"
-PLOTS_DIR   = os.path.join(RESULTS_DIR, "plots")
-CSV_PATH    = os.path.join(RESULTS_DIR, "results.csv")
+PLOTS_DIR = os.path.join(RESULTS_DIR, "plots")
+
+RESULTS_CSV_HEADER = [
+    "exp_id", "algorithm", "map_name", "success_rate", "reward_schedule",
+    "agent_seed", "env_seed", "map_seed",
+    "hyperparams_json",
+    "total_train_time_s", "n_train_episodes", "n_train_iterations",
+    "eval_success_rate", "eval_mean_reward", "eval_mean_steps",
+    "eval_termination_goal_pct", "eval_termination_hole_pct",
+    "eval_truncation_pct",
+    "eval_policy_agreement_vi", "n_state_action_visited_pct",
+    "final_q_diff_l_inf",
+]
+
+CURVES_CSV_HEADER = [
+    "exp_id", "algorithm", "agent_seed", "episode",
+    "train_reward", "train_steps", "train_success",
+    "epsilon", "alpha", "elapsed_time_s",
+]
 
 COLORS = {
     "Value Iteration": "steelblue",
-    "REINFORCE":       "tomato",
-    "Q-Learning":      "seagreen",
-    "Model Based":     "mediumpurple",
+    "REINFORCE": "tomato",
+    "Q-Learning": "seagreen",
+    "Model Based": "mediumpurple",
 }
 
 ACTIVE_AGENTS = [
@@ -44,549 +69,784 @@ EPISODE_DEPENDENT = {"REINFORCE", "Q-Learning"}
 
 AGENT_KEYS = {
     "Value Iteration": "value_iteration",
-    "REINFORCE":       "reinforce",
-    "Q-Learning":      "qlearning",
-    "Model Based":     "model_based",
+    "REINFORCE": "reinforce",
+    "Q-Learning": "qlearning",
+    "Model Based": "model_based",
 }
 
-# Semillas fijas para reproducibilidad
-# En calibraciones se usa solo SEEDS[0]; en el experimento principal las 3
-SEEDS = [42, 123, 7]
+SEEDS_CALIBRATION = list(config.SEEDS_DEFAULT)
+SEEDS_MAIN_SMALL = list(config.SEEDS_DEFAULT)
+SEEDS_MAIN_LARGE = list(config.SEEDS_LARGE_MAP)
+MAP_SEED = config.SEED
 
 
 def setup_dirs():
+    os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(PLOTS_DIR, exist_ok=True)
 
 
-# ── Entrenamiento y evaluación ────────────────────────────────────────────────
+# -- Utilidades de reproducibilidad y config ---------------------------------
 
-def _set_seed(seed):
-    np.random.seed(seed)
-    import random
-    random.seed(seed)
+def _set_seed(agent_seed, env=None, env_seed=None):
+    """
+    Fija las semillas del agente y, opcionalmente, del entorno.
+    """
+    np.random.seed(agent_seed)
+    random.seed(agent_seed)
 
+    if env is not None and env_seed is not None:
+        env.reset(seed=env_seed)
+        if hasattr(env.action_space, "seed"):
+            env.action_space.seed(env_seed)
+        if hasattr(env.observation_space, "seed"):
+            env.observation_space.seed(env_seed)
+
+    return env_seed
+
+
+@contextlib.contextmanager
+def _temporary_config(**values):
+    originals = {name: getattr(config, name) for name in values}
+    try:
+        for name, value in values.items():
+            setattr(config, name, value)
+        yield
+    finally:
+        for name, value in originals.items():
+            setattr(config, name, value)
+
+
+def _label_float(value):
+    return f"{value:.3f}".rstrip("0").rstrip(".").replace(".", "p")
+
+
+def _is_large_map(map_name):
+    return map_name not in {"4x4", "8x8"}
+
+
+def _effective_reward_schedule(reward_schedule):
+    return tuple(reward_schedule if reward_schedule is not None else config.REWARD_SCHEDULE)
+
+
+def _hyperparams_snapshot(gamma):
+    return {
+        "gamma": gamma,
+        "learning_rate": config.LEARNING_RATE,
+        "lr_decay": config.LR_DECAY,
+        "epsilon": config.EPSILON,
+        "epsilon_decay": config.EPSILON_DECAY,
+        "epsilon_min": config.EPSILON_MIN,
+        "reinforce_lr": config.REINFORCE_LR,
+        "num_transitions_mb": config.NUM_TRANSITIONS_MB,
+        "planning_steps_per_iter": config.PLANNING_STEPS_PER_ITER,
+        "theta_convergence": config.THETA_CONVERGENCE,
+        "t_max": config.T_MAX,
+    }
+
+
+# -- CSV ----------------------------------------------------------------------
+
+def _csv_path(prefix, exp_id):
+    safe_exp_id = str(exp_id).replace(" ", "_").replace("/", "_")
+    return os.path.join(RESULTS_DIR, f"{prefix}_{safe_exp_id}.csv")
+
+
+def _init_results_csv(exp_id):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = _csv_path("results", exp_id)
+    if not os.path.exists(path):
+        with open(path, "w", newline="") as file:
+            csv.writer(file).writerow(RESULTS_CSV_HEADER)
+    return path
+
+
+def _append_results_csv(exp_id, run):
+    path = _init_results_csv(exp_id)
+    row = [
+        exp_id,
+        run["algorithm"],
+        run["map_name"],
+        run["success_rate"],
+        str(tuple(run["reward_schedule"])),
+        run["agent_seed"],
+        run["env_seed"],
+        run["map_seed"],
+        json.dumps(run["hyperparams"], sort_keys=True),
+        run["total_train_time_s"],
+        run["n_train_episodes"],
+        run["n_train_iterations"],
+        run["eval_success_rate"],
+        run["eval_mean_reward"],
+        run["eval_mean_steps"],
+        run["eval_termination_goal_pct"],
+        run["eval_termination_hole_pct"],
+        run["eval_truncation_pct"],
+        run.get("eval_policy_agreement_vi"),
+        run.get("n_state_action_visited_pct"),
+        run.get("final_q_diff_l_inf"),
+    ]
+    with open(path, "a", newline="") as file:
+        csv.writer(file).writerow(row)
+
+
+def _init_curves_csv(exp_id):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = _csv_path("learning_curves", exp_id)
+    if not os.path.exists(path):
+        with open(path, "w", newline="") as file:
+            csv.writer(file).writerow(CURVES_CSV_HEADER)
+    return path
+
+
+def _append_curves_csv(exp_id, run):
+    history = run.get("history")
+    if not isinstance(history, list) or not history:
+        return
+    if run["algorithm"] == "Value Iteration":
+        return
+
+    path = _init_curves_csv(exp_id)
+    is_episodic = run["algorithm"] in EPISODE_DEPENDENT
+
+    with open(path, "a", newline="") as file:
+        writer = csv.writer(file)
+        for index, value in enumerate(history, start=1):
+            writer.writerow([
+                exp_id,
+                run["algorithm"],
+                run["agent_seed"],
+                index,
+                value,
+                None,
+                1 if is_episodic and value > 0 else None,
+                None,
+                None,
+                None,
+            ])
+
+
+# -- Entrenamiento y evaluacion ----------------------------------------------
 
 def train_agent(agent):
-    start   = time.time()
-    result  = agent.train()
+    start = time.time()
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = agent.train()
     elapsed = time.time() - start
     history = result if isinstance(result, list) else []
-    return history, elapsed
+    return result, history, elapsed
 
 
-def run_single(agent_name, map_name, success_rate, gamma, num_episodes, seed):
-    """Entrena y evalúa un agente con una semilla concreta. Devuelve dict de métricas."""
-    _set_seed(seed)
-    config.GAMMA        = gamma
-    config.NUM_EPISODES = num_episodes
+def _train_iterations(agent_name, train_result, history):
+    if agent_name == "Value Iteration" and isinstance(train_result, int):
+        return train_result
+    if agent_name == "Model Based":
+        return len(history)
+    return None
 
-    env     = create_env(map_name=map_name, success_rate=success_rate)
-    agent   = build_agent(AGENT_KEYS[agent_name], env)
-    history, elapsed = train_agent(agent)
-    pct, avg_r = evaluate_agent(agent, env)
-    env.close()
-    return {"success": pct, "avg_reward": avg_r, "time": elapsed, "history": history}
+
+def run_single(agent_name, map_name, success_rate, gamma, num_episodes,
+               agent_seed, env_seed=None, reward_schedule=None,
+               compute_oracle=True):
+    """
+    Entrena y evalua un agente con una semilla concreta.
+    Devuelve todas las metricas necesarias para los CSVs del plan.
+    """
+    original_gamma = config.GAMMA
+    original_num_episodes = config.NUM_EPISODES
+    original_t_max = config.T_MAX
+    env = None
+
+    try:
+        _set_seed(agent_seed)
+        config.GAMMA = gamma
+        config.NUM_EPISODES = num_episodes
+        config.T_MAX = config.get_t_max(map_name)
+
+        effective_reward = _effective_reward_schedule(reward_schedule)
+        map_seed = MAP_SEED if _is_large_map(map_name) else None
+
+        env = create_env(
+            map_name=map_name,
+            success_rate=success_rate,
+            reward_schedule=effective_reward,
+            map_seed=MAP_SEED,
+        )
+        if env_seed is not None:
+            _set_seed(agent_seed, env=env, env_seed=env_seed)
+
+        agent = build_agent(AGENT_KEYS[agent_name], env)
+        train_result, history, elapsed = train_agent(agent)
+
+        eval_metrics = evaluate_agent(agent, env)
+        coverage = compute_state_action_coverage(agent, env)
+
+        oracle_metrics = {
+            "eval_policy_agreement_vi": None,
+            "final_q_diff_l_inf": None,
+        }
+        if agent_name == "Value Iteration":
+            oracle_metrics["eval_policy_agreement_vi"] = 100.0
+        elif compute_oracle and map_name in {"4x4", "8x8"}:
+            try:
+                oracle_metrics = evaluate_agent_with_oracle(agent, env)
+            except Exception as exc:
+                print(f"      [oracle skip: {exc}]")
+
+        return {
+            "agent": agent_name,
+            "algorithm": agent_name,
+            "map_name": map_name,
+            "success_rate": success_rate,
+            "reward_schedule": effective_reward,
+            "agent_seed": agent_seed,
+            "env_seed": env_seed,
+            "map_seed": map_seed,
+            "gamma": gamma,
+            "num_episodes": num_episodes,
+            "hyperparams": _hyperparams_snapshot(gamma),
+            "total_train_time_s": elapsed,
+            "n_train_episodes": num_episodes,
+            "n_train_iterations": _train_iterations(agent_name, train_result, history),
+            "n_state_action_visited_pct": coverage,
+            "history": history,
+            **eval_metrics,
+            **oracle_metrics,
+        }
+    finally:
+        if env is not None:
+            env.close()
+        config.GAMMA = original_gamma
+        config.NUM_EPISODES = original_num_episodes
+        config.T_MAX = original_t_max
+
+
+def _aggregate_runs(runs):
+    """Calcula media y std de las metricas numericas entre semillas."""
+    numeric_keys = [
+        "total_train_time_s",
+        "n_train_episodes",
+        "n_train_iterations",
+        "eval_success_rate",
+        "eval_mean_reward",
+        "eval_mean_steps",
+        "eval_termination_goal_pct",
+        "eval_termination_hole_pct",
+        "eval_truncation_pct",
+        "eval_policy_agreement_vi",
+        "n_state_action_visited_pct",
+        "final_q_diff_l_inf",
+    ]
+    agg = {}
+    for key in numeric_keys:
+        vals = [
+            run[key] for run in runs
+            if run.get(key) is not None and not isinstance(run.get(key), bool)
+        ]
+        if vals:
+            agg[f"{key}_mean"] = float(np.mean(vals))
+            agg[f"{key}_std"] = float(np.std(vals))
+        else:
+            agg[f"{key}_mean"] = None
+            agg[f"{key}_std"] = None
+
+    agg["history"] = runs[0].get("history", []) if runs else []
+    agg["runs"] = runs
+    return agg
 
 
 def run_agents(agents_to_run, map_name, success_rate, gamma,
-               num_episodes, save, label, seeds=None):
+               num_episodes, save, exp_label, seeds=None,
+               reward_schedule=None):
     """
-    Entrena y evalúa cada agente.
-    Si seeds tiene más de un valor, promedia los resultados y calcula std.
+    Entrena y evalua cada agente con multiples semillas.
+    Guarda una fila por (agente, semilla) y curvas por episodio/iteracion.
     """
     if seeds is None:
-        seeds = [SEEDS[0]]
+        seeds = SEEDS_CALIBRATION
 
-    config.GAMMA        = gamma
-    config.NUM_EPISODES = num_episodes
-
-    results   = {}
-    histories = {}
-
+    results_per_agent = {}
     for name in agents_to_run:
-        print(f"    [{name}] entrenando ({len(seeds)} semilla/s)...", end=" ", flush=True)
+        print(f"    [{name}] entrenando ({len(seeds)} semillas)...", flush=True)
+        runs = []
+        for seed in seeds:
+            run = run_single(
+                name,
+                map_name,
+                success_rate,
+                gamma,
+                num_episodes,
+                agent_seed=seed,
+                env_seed=seed,
+                reward_schedule=reward_schedule,
+            )
+            runs.append(run)
+            if save:
+                _append_results_csv(exp_label, run)
+                _append_curves_csv(exp_label, run)
 
-        runs = [run_single(name, map_name, success_rate, gamma, num_episodes, s)
-                for s in seeds]
+        aggregated = _aggregate_runs(runs)
+        results_per_agent[name] = aggregated
+        print(
+            f"      exito={aggregated['eval_success_rate_mean']:.1f}% "
+            f"(+/-{aggregated['eval_success_rate_std']:.1f}) | "
+            f"reward={aggregated['eval_mean_reward_mean']:.3f} | "
+            f"tiempo={aggregated['total_train_time_s_mean']:.2f}s"
+        )
 
-        pct_vals  = [r["success"]    for r in runs]
-        time_vals = [r["time"]       for r in runs]
-        avg_vals  = [r["avg_reward"] for r in runs]
-
-        results[name] = {
-            "success":     np.mean(pct_vals),
-            "success_std": np.std(pct_vals),
-            "avg_reward":  np.mean(avg_vals),
-            "time":        np.mean(time_vals),
-            "history":     runs[0]["history"],   # curva de la primera semilla
-        }
-        histories[name] = results[name]["history"]
-
-        print(f"éxito={results[name]['success']:.1f}% "
-              f"(±{results[name]['success_std']:.1f}) | "
-              f"tiempo={results[name]['time']:.2f}s")
-
-        if save:
-            _append_csv(label, map_name, success_rate, gamma, num_episodes,
-                        name, results[name]["success"], results[name]["avg_reward"],
-                        results[name]["time"])
-
-    return results, histories
+    return results_per_agent
 
 
-# ── CALIBRACIÓN A — Gamma ─────────────────────────────────────────────────────
+def _best_value_by_metric(results_dict, metric="eval_success_rate_mean"):
+    """Devuelve la clave cuyo resultado maximiza la metrica indicada."""
+    return max(
+        results_dict.keys(),
+        key=lambda key: (
+            -float("inf")
+            if results_dict[key].get(metric) is None
+            else results_dict[key].get(metric)
+        ),
+    )
+
+
+# -- Calibracion A: Gamma -----------------------------------------------------
 
 def calibration_gamma(save=False):
-    """
-    Varía gamma = [0.90, 0.95, 0.99].
-    Fija: 4x4, SR=1/3 (máxima estocasticidad), semilla fija.
-    Todos los algoritmos.
-    Hipótesis: gamma alto funciona mejor porque las rutas óptimas son largas.
-    """
     print("\n" + "=" * 55)
-    print("CALIBRACIÓN A — Efecto de gamma")
+    print("CALIBRACION A - Efecto de gamma")
     print("=" * 55)
 
-    gammas   = [0.90, 0.95, 0.99]
+    gammas = list(config.CAL_A_GAMMAS)
     map_name = "4x4"
-    sr       = 1 / 3
-    num_ep   = config.NUM_EPISODES
+    sr = config.EXPERIMENT_BASE_SUCCESS_RATE
 
     all_results = {}
-    for g in gammas:
-        print(f"\n  γ={g} | Mapa={map_name} | SR={sr:.2f}")
-        res, _ = run_agents(ACTIVE_AGENTS, map_name, sr, g, num_ep,
-                            save, f"calA_g{g}")
-        all_results[g] = res
+    with _temporary_config(
+        LEARNING_RATE=config.CAL_A_BASE_LEARNING_RATE,
+        EPSILON=config.CAL_A_BASE_EPSILON,
+        EPSILON_DECAY=config.CAL_A_BASE_EPSILON_DECAY,
+        EPSILON_MIN=config.CAL_A_BASE_EPSILON_MIN,
+        LR_DECAY=config.CAL_A_BASE_LR_DECAY,
+        REINFORCE_LR=config.CAL_A_BASE_REINFORCE_LR,
+        NUM_TRANSITIONS_MB=config.CAL_A_NUM_TRANSITIONS_MB,
+        THETA_CONVERGENCE=config.CAL_A_THETA_CONVERGENCE,
+    ):
+        for gamma in gammas:
+            print(f"\n  gamma={gamma} | mapa={map_name} | SR={sr:.3f}")
+            label = f"cal_A_g{_label_float(gamma)}"
+            result = {}
+            result.update(run_agents(
+                ["Value Iteration", "Model Based", "Q-Learning"],
+                map_name, sr, gamma, config.CAL_A_Q_EPISODES, save, label,
+                seeds=SEEDS_CALIBRATION,
+            ))
+            result.update(run_agents(
+                ["REINFORCE"],
+                map_name, sr, gamma, config.CAL_A_REINFORCE_EPISODES, save, label,
+                seeds=SEEDS_CALIBRATION,
+            ))
+            all_results[gamma] = result
 
     if save:
-        _plot_line(all_results, gammas, "Gamma (γ)",
-                   "Cal. A: % Éxito vs Gamma", "calA_gamma.png")
-        _plot_time_line(all_results, gammas, "Gamma (γ)",
-                        "Cal. A: Tiempo vs Gamma", "calA_gamma_time.png")
+        _plot_line(all_results, gammas, "Gamma",
+                   "Cal. A: exito vs gamma", "calA_gamma.png")
+        _plot_time_line(all_results, gammas, "Gamma",
+                        "Cal. A: tiempo vs gamma", "calA_gamma_time.png")
 
-    print("\n→ Usa el gamma con mayor % éxito en el experimento principal.")
     return all_results
 
 
-# ── CALIBRACIÓN B — Episodios ─────────────────────────────────────────────────
+# -- Calibracion B: Episodios -------------------------------------------------
 
 def calibration_episodes(save=False):
-    """
-    Varía episodios = [500, 1000, 2000, 5000].
-    Solo Q-Learning y REINFORCE. Fija: 4x4, SR=0.8, gamma=config.GAMMA.
-    Hipótesis: Q-Learning converge antes que REINFORCE por menor varianza.
-    """
     print("\n" + "=" * 55)
-    print("CALIBRACIÓN B — Número de episodios")
+    print("CALIBRACION B - Numero de episodios")
     print("=" * 55)
 
-    episode_counts  = [500, 1000, 2000, 5000]
-    map_name, sr, gamma = "4x4", 0.8, config.GAMMA
-    episodic_active = [a for a in ACTIVE_AGENTS if a in EPISODE_DEPENDENT]
+    episode_counts = list(config.CAL_B_EPISODE_COUNTS)
+    map_name = "4x4"
+    sr = config.EXPERIMENT_BASE_SUCCESS_RATE
+    gamma = config.GAMMA
+    agents = [agent for agent in ACTIVE_AGENTS if agent in EPISODE_DEPENDENT]
 
-    if not episodic_active:
-        print("  (ningún agente episódico activo)")
-        return {}
-
-    all_results   = {}
-    all_histories = {}
+    all_results = {}
     for num_ep in episode_counts:
-        print(f"\n  ep={num_ep} | Mapa={map_name} | SR={sr} | γ={gamma}")
-        res, hist = run_agents(episodic_active, map_name, sr, gamma, num_ep,
-                               save, f"calB_ep{num_ep}")
-        all_results[num_ep]   = res
-        all_histories[num_ep] = hist
+        print(f"\n  episodios={num_ep} | mapa={map_name} | SR={sr:.3f}")
+        label = f"cal_B_ep{num_ep}"
+        all_results[num_ep] = run_agents(
+            agents, map_name, sr, gamma, num_ep, save, label,
+            seeds=SEEDS_CALIBRATION,
+        )
 
     if save:
-        _plot_line(all_results, episode_counts, "Nº episodios",
-                   "Cal. B: % Éxito vs Episodios", "calB_episodes.png")
-        _plot_curves(all_histories[episode_counts[-1]],
-                     f"Cal. B: Curvas ({episode_counts[-1]} ep.)",
+        _plot_line(all_results, episode_counts, "Episodios",
+                   "Cal. B: exito vs episodios", "calB_episodes.png")
+        _plot_curves(_histories_from_result(all_results[episode_counts[-1]]),
+                     f"Cal. B: curvas {episode_counts[-1]} episodios",
                      f"calB_curves_{episode_counts[-1]}ep.png")
 
-    print("\n→ Usa el mínimo donde la curva se estabiliza.")
     return all_results
 
 
-# ── CALIBRACIÓN C — Reward shaping ───────────────────────────────────────────
+# -- Calibracion C: Reward schedule ------------------------------------------
 
 def calibration_reward(save=False):
-    """
-    Compara tres señales de recompensa:
-      - default:      recompensa original (1 meta, 0 resto)
-      - hole_penalty: penalización por hoyo (-1)
-      - step_penalty: penalización por paso (-0.01)
-    Solo Q-Learning y REINFORCE. Fija: 4x4, SR=0.8.
-    Hipótesis: penalizar el hoyo da señal negativa inmediata y ayuda a converger.
-    """
     print("\n" + "=" * 55)
-    print("CALIBRACIÓN C — Señal de recompensa")
+    print("CALIBRACION C - Senal de recompensa")
     print("=" * 55)
 
-    episodic_active = [a for a in ACTIVE_AGENTS if a in EPISODE_DEPENDENT]
-    if not episodic_active:
-        print("  (ningún agente episódico activo)")
-        return {}
+    reward_configs = dict(config.CAL_C_REWARD_CONFIGS)
+    agents = [agent for agent in ACTIVE_AGENTS if agent in EPISODE_DEPENDENT]
+    map_name = "4x4"
+    sr = config.EXPERIMENT_BASE_SUCCESS_RATE
+    gamma = config.GAMMA
+    num_ep = config.NUM_EPISODES
 
-    map_name, sr, gamma, num_ep = "4x4", 0.8, config.GAMMA, config.NUM_EPISODES
-
-    reward_configs = {
-        "default":      {"DEFAULT_REWARD": True,  "HOLE_PENALTY":  0.0,  "STEP_PENALTY":  0.0},
-        "hole_penalty": {"DEFAULT_REWARD": False, "HOLE_PENALTY": -1.0,  "STEP_PENALTY":  0.0},
-        "step_penalty": {"DEFAULT_REWARD": False, "HOLE_PENALTY":  0.0,  "STEP_PENALTY": -0.01},
-    }
-
-    all_results   = {}
-    all_histories = {}
-
-    for reward_name, reward_cfg in reward_configs.items():
-        for k, v in reward_cfg.items():
-            setattr(config, k, v)
-        print(f"\n  Reward={reward_name} | Mapa={map_name} | SR={sr}")
-        res, hist = run_agents(episodic_active, map_name, sr, gamma, num_ep,
-                               save, f"calC_{reward_name}")
-        all_results[reward_name]   = res
-        all_histories[reward_name] = hist
-
-    # Restaurar config
-    config.DEFAULT_REWARD = False
-    config.HOLE_PENALTY   = -0.5
-    config.STEP_PENALTY   = 0.0
+    all_results = {}
+    for reward_name, reward_schedule in reward_configs.items():
+        print(f"\n  reward={reward_name} | mapa={map_name} | SR={sr:.3f}")
+        label = f"cal_C_{reward_name}"
+        all_results[reward_name] = run_agents(
+            agents, map_name, sr, gamma, num_ep, save, label,
+            seeds=SEEDS_CALIBRATION,
+            reward_schedule=reward_schedule,
+        )
 
     if save:
-        reward_labels = list(reward_configs.keys())
-        fig, axes = plt.subplots(1, len(episodic_active),
-                                 figsize=(6 * len(episodic_active), 5))
-        if len(episodic_active) == 1:
-            axes = [axes]
-        for ax, agent in zip(axes, episodic_active):
-            vals = [all_results[r][agent]["success"] for r in reward_labels]
-            bars = ax.bar(reward_labels, vals,
-                          color=["steelblue", "tomato", "seagreen"])
-            ax.set_title(agent)
-            ax.set_ylabel("% Éxito")
-            ax.set_ylim(0, 110)
-            for bar, val in zip(bars, vals):
-                ax.text(bar.get_x() + bar.get_width() / 2,
-                        bar.get_height() + 1,
-                        f"{val:.1f}%", ha="center", fontsize=9)
-            ax.grid(axis="y")
-        fig.suptitle("Cal. C: % Éxito por señal de recompensa")
-        plt.tight_layout()
-        plt.savefig(os.path.join(PLOTS_DIR, "calC_reward.png"))
-        plt.close()
-
-        for reward_name in reward_labels:
-            _plot_curves(all_histories[reward_name],
-                         f"Cal. C: Curvas — {reward_name}",
+        _plot_reward_bars(all_results, list(reward_configs.keys()), agents)
+        for reward_name, result in all_results.items():
+            _plot_curves(_histories_from_result(result),
+                         f"Cal. C: curvas {reward_name}",
                          f"calC_curves_{reward_name}.png")
 
-    print("\n→ Usa la señal con mejor % éxito en el experimento principal.")
     return all_results
 
 
-# ── CALIBRACIÓN D — Epsilon y Alpha (Q-Learning) ─────────────────────────────
+# -- Calibracion D: Epsilon y alpha Q-Learning -------------------------------
 
 def calibration_epsilon(save=False):
-    """
-    D1: varía epsilon ∈ {0.1, 0.3, 0.5, 0.8, 1.0} con alpha fijo.
-    D2: varía alpha ∈ {0.05, 0.1, 0.3, 0.5} con el epsilon ganador de D1.
-    Solo Q-Learning. Fija: 4x4, SR=0.8.
-    Hipótesis: epsilon muy bajo converge a subóptimo, muy alto tarda más.
-               Alpha alto aprende rápido pero puede oscilar.
-    """
     print("\n" + "=" * 55)
-    print("CALIBRACIÓN D — Epsilon y Alpha (Q-Learning)")
+    print("CALIBRACION D - Epsilon y alpha (Q-Learning)")
     print("=" * 55)
 
-    if "Q-Learning" not in ACTIVE_AGENTS:
-        print("  (Q-Learning no está activo)")
-        return {}
+    map_name = "4x4"
+    sr = config.EXPERIMENT_BASE_SUCCESS_RATE
+    gamma = config.GAMMA
+    num_ep = config.NUM_EPISODES
+    epsilons = list(config.CAL_D_EPSILONS)
+    alphas = list(config.CAL_D_ALPHAS)
 
-    map_name, sr, gamma, num_ep = "4x4", 0.8, config.GAMMA, config.NUM_EPISODES
-    epsilons = [0.1, 0.3, 0.5, 0.8, 1.0]
-    alphas   = [0.05, 0.1, 0.3, 0.5]
-
-    original_epsilon = config.EPSILON
-    original_lr      = config.LEARNING_RATE
-
-    # D1 — variación de epsilon
-    print("\n  D1 — Variando epsilon (alpha fijo)")
-    results_eps   = {}
+    results_eps = {}
     histories_eps = {}
-    for eps in epsilons:
-        config.EPSILON = eps
-        print(f"\n  ε={eps} | α={config.LEARNING_RATE} | Mapa={map_name} | SR={sr}")
-        env     = create_env(map_name=map_name, success_rate=sr)
-        agent   = build_agent("qlearning", env)
-        history, elapsed = train_agent(agent)
-        pct, avg_r = evaluate_agent(agent, env)
-        env.close()
-        print(f"    éxito={pct:.1f}% | tiempo={elapsed:.2f}s")
-        results_eps[eps]   = {"success": pct, "avg_reward": avg_r, "time": elapsed}
-        histories_eps[eps] = history
-        if save:
-            _append_csv(f"calD1_eps{eps}", map_name, sr, gamma,
-                        num_ep, "Q-Learning", pct, avg_r, elapsed)
+    original_epsilon = config.EPSILON
+    original_lr = config.LEARNING_RATE
 
-    config.EPSILON = original_epsilon
+    try:
+        print("\n  D1 - Variando epsilon")
+        config.LEARNING_RATE = config.CAL_D_ANCHOR_ALPHA
+        for epsilon in epsilons:
+            config.EPSILON = epsilon
+            print(f"\n  epsilon={epsilon} | alpha={config.LEARNING_RATE}")
+            label = f"cal_D1_eps{_label_float(epsilon)}"
+            result = run_agents(
+                ["Q-Learning"], map_name, sr, gamma, num_ep, save, label,
+                seeds=SEEDS_CALIBRATION,
+            )
+            results_eps[epsilon] = result["Q-Learning"]
+            histories_eps[epsilon] = result["Q-Learning"]["history"]
 
-    # D2 — variación de alpha
-    print("\n  D2 — Variando alpha (epsilon fijo)")
-    results_alpha   = {}
-    histories_alpha = {}
-    for alpha in alphas:
-        config.LEARNING_RATE = alpha
-        print(f"\n  ε={config.EPSILON} | α={alpha} | Mapa={map_name} | SR={sr}")
-        env     = create_env(map_name=map_name, success_rate=sr)
-        agent   = build_agent("qlearning", env)
-        history, elapsed = train_agent(agent)
-        pct, avg_r = evaluate_agent(agent, env)
-        env.close()
-        print(f"    éxito={pct:.1f}% | tiempo={elapsed:.2f}s")
-        results_alpha[alpha]   = {"success": pct, "avg_reward": avg_r, "time": elapsed}
-        histories_alpha[alpha] = history
-        if save:
-            _append_csv(f"calD2_alpha{alpha}", map_name, sr, gamma,
-                        num_ep, "Q-Learning", pct, avg_r, elapsed)
+        best_eps = _best_value_by_metric(results_eps)
+        print(f"\n  Ganador D1: epsilon={best_eps}")
 
-    config.LEARNING_RATE = original_lr
+        print("\n  D2 - Variando alpha")
+        config.EPSILON = best_eps
+        results_alpha = {}
+        histories_alpha = {}
+        for alpha in alphas:
+            config.LEARNING_RATE = alpha
+            print(f"\n  epsilon={best_eps} | alpha={alpha}")
+            label = f"cal_D2_alpha{_label_float(alpha)}"
+            result = run_agents(
+                ["Q-Learning"], map_name, sr, gamma, num_ep, save, label,
+                seeds=SEEDS_CALIBRATION,
+            )
+            results_alpha[alpha] = result["Q-Learning"]
+            histories_alpha[alpha] = result["Q-Learning"]["history"]
+    finally:
+        config.EPSILON = original_epsilon
+        config.LEARNING_RATE = original_lr
 
     if save:
-        _plot_line_single(results_eps, epsilons, "Epsilon inicial (ε)",
-                          "Cal. D1: % Éxito vs Epsilon (Q-Learning)",
+        _plot_line_single(results_eps, epsilons, "Epsilon inicial",
+                          "Cal. D1: exito vs epsilon",
                           "calD1_epsilon.png", "Q-Learning")
-        _plot_line_single(results_alpha, alphas, "Learning rate (α)",
-                          "Cal. D2: % Éxito vs Alpha (Q-Learning)",
+        _plot_line_single(results_alpha, alphas, "Learning rate",
+                          "Cal. D2: exito vs alpha",
                           "calD2_alpha.png", "Q-Learning")
-        _plot_curves({f"ε={epsilons[-1]}": histories_eps[epsilons[-1]]},
-                     f"Cal. D1: Curva ε={epsilons[-1]}",
-                     f"calD1_curves_eps{epsilons[-1]}.png")
-        _plot_curves({f"α={alphas[-1]}": histories_alpha[alphas[-1]]},
-                     f"Cal. D2: Curva α={alphas[-1]}",
-                     f"calD2_curves_alpha{alphas[-1]}.png")
+        _plot_curves({f"epsilon={best_eps}": histories_eps[best_eps]},
+                     f"Cal. D1: curva epsilon={best_eps}",
+                     f"calD1_curves_eps{_label_float(best_eps)}.png")
+        best_alpha = _best_value_by_metric(results_alpha)
+        _plot_curves({f"alpha={best_alpha}": histories_alpha[best_alpha]},
+                     f"Cal. D2: curva alpha={best_alpha}",
+                     f"calD2_curves_alpha{_label_float(best_alpha)}.png")
 
-    print("\n→ Usa el epsilon y alpha con mejor % éxito en el experimento principal.")
     return {"epsilon": results_eps, "alpha": results_alpha}
 
 
-# ── CALIBRACIÓN E — Learning rate REINFORCE ───────────────────────────────────
+# -- Calibracion E: Alpha REINFORCE ------------------------------------------
 
 def calibration_reinforce_lr(save=False):
-    """
-    Varía REINFORCE_LR ∈ {0.001, 0.01, 0.05, 0.1}.
-    Fija: 4x4, SR=0.8, gamma=config.GAMMA, episodios=config.NUM_EPISODES.
-    Solo REINFORCE.
-    Hipótesis: LR muy alto hace el gradiente inestable; muy bajo converge lento.
-    """
     print("\n" + "=" * 55)
-    print("CALIBRACIÓN E — Learning rate REINFORCE")
+    print("CALIBRACION E - Learning rate REINFORCE")
     print("=" * 55)
 
-    if "REINFORCE" not in ACTIVE_AGENTS:
-        print("  (REINFORCE no está activo)")
-        return {}
+    map_name = "4x4"
+    sr = config.EXPERIMENT_BASE_SUCCESS_RATE
+    gamma = config.GAMMA
+    num_ep = config.NUM_EPISODES
+    learning_rates = list(config.CAL_E_REINFORCE_LRS)
 
-    map_name, sr, gamma, num_ep = "4x4", 0.8, config.GAMMA, config.NUM_EPISODES
-    lrs = [0.001, 0.01, 0.05, 0.1]
     original_lr = config.REINFORCE_LR
-
-    results_lr   = {}
+    results_lr = {}
     histories_lr = {}
-
-    for lr in lrs:
-        config.REINFORCE_LR = lr
-        print(f"\n  LR={lr} | Mapa={map_name} | SR={sr} | γ={gamma}")
-        env     = create_env(map_name=map_name, success_rate=sr)
-        agent   = build_agent("reinforce", env)
-        history, elapsed = train_agent(agent)
-        pct, avg_r = evaluate_agent(agent, env)
-        env.close()
-        print(f"    éxito={pct:.1f}% | tiempo={elapsed:.2f}s")
-        results_lr[lr]   = {"success": pct, "avg_reward": avg_r, "time": elapsed}
-        histories_lr[lr] = history
-        if save:
-            _append_csv(f"calE_lr{lr}", map_name, sr, gamma,
-                        num_ep, "REINFORCE", pct, avg_r, elapsed)
-
-    config.REINFORCE_LR = original_lr
+    try:
+        for lr in learning_rates:
+            config.REINFORCE_LR = lr
+            print(f"\n  lr={lr} | mapa={map_name} | SR={sr:.3f}")
+            label = f"cal_E_lr{_label_float(lr)}"
+            result = run_agents(
+                ["REINFORCE"], map_name, sr, gamma, num_ep, save, label,
+                seeds=SEEDS_CALIBRATION,
+            )
+            results_lr[lr] = result["REINFORCE"]
+            histories_lr[lr] = result["REINFORCE"]["history"]
+    finally:
+        config.REINFORCE_LR = original_lr
 
     if save:
-        _plot_line_single(results_lr, lrs, "Learning rate (α)",
-                          "Cal. E: % Éxito vs LR (REINFORCE)",
+        _plot_line_single(results_lr, learning_rates, "Learning rate",
+                          "Cal. E: exito vs LR (REINFORCE)",
                           "calE_reinforce_lr.png", "REINFORCE")
-        _plot_curves({f"lr={lrs[-1]}": histories_lr[lrs[-1]]},
-                     f"Cal. E: Curva LR={lrs[-1]}",
-                     f"calE_curves_lr{lrs[-1]}.png")
+        best_lr = _best_value_by_metric(results_lr)
+        _plot_curves({f"lr={best_lr}": histories_lr[best_lr]},
+                     f"Cal. E: curva LR={best_lr}",
+                     f"calE_curves_lr{_label_float(best_lr)}.png")
 
-    print("\n→ Usa el LR con mejor % éxito en el experimento principal.")
     return results_lr
 
 
-# ── CALIBRACIÓN F — Transiciones muestreadas (Model Based) ───────────────────
+# -- Calibracion F: Transiciones Model Based ---------------------------------
 
 def calibration_transitions(save=False):
-    """
-    Varía transiciones por iteración ∈ {100, 500, 1000, 5000}.
-    Solo Model Based. Fija: 4x4, SR=0.8, gamma=config.GAMMA.
-    Hipótesis: pocas transiciones dan estimaciones imprecisas del MDP;
-               muchas aumentan el tiempo sin mejorar el resultado.
-    """
     print("\n" + "=" * 55)
-    print("CALIBRACIÓN F — Transiciones muestreadas (Model Based)")
+    print("CALIBRACION F - Transiciones muestreadas (Model Based)")
     print("=" * 55)
 
-    if "Model Based" not in ACTIVE_AGENTS:
-        print("  (Model Based no está activo)")
-        return {}
+    map_name = "4x4"
+    sr = config.EXPERIMENT_BASE_SUCCESS_RATE
+    gamma = config.GAMMA
+    num_ep = config.NUM_EPISODES
+    transition_counts = list(config.CAL_F_TRANSITION_COUNTS)
 
-    map_name, sr, gamma, num_ep = "4x4", 0.8, config.GAMMA, config.NUM_EPISODES
-    transitions = [100, 500, 1000, 5000]
-
-    # Model Based usa NUM_TRAJECTORIES si está en config, si no lo añadimos
-    if not hasattr(config, "NUM_TRAJECTORIES"):
-        config.NUM_TRAJECTORIES = 100
-    original_traj = config.NUM_TRAJECTORIES
-
-    results_traj   = {}
-    histories_traj = {}
-
-    for traj in transitions:
-        config.NUM_TRAJECTORIES = traj
-        print(f"\n  traj={traj} | Mapa={map_name} | SR={sr} | γ={gamma}")
-        env     = create_env(map_name=map_name, success_rate=sr)
-        agent   = build_agent("model_based", env)
-        history, elapsed = train_agent(agent)
-        pct, avg_r = evaluate_agent(agent, env)
-        env.close()
-        print(f"    éxito={pct:.1f}% | tiempo={elapsed:.2f}s")
-        results_traj[traj]   = {"success": pct, "avg_reward": avg_r, "time": elapsed}
-        histories_traj[traj] = history
-        if save:
-            _append_csv(f"calF_traj{traj}", map_name, sr, gamma,
-                        num_ep, "Model Based", pct, avg_r, elapsed)
-
-    config.NUM_TRAJECTORIES = original_traj
+    original_transitions = config.NUM_TRANSITIONS_MB
+    results_transitions = {}
+    try:
+        for transitions in transition_counts:
+            config.NUM_TRANSITIONS_MB = transitions
+            print(f"\n  transiciones={transitions} | mapa={map_name} | SR={sr:.3f}")
+            label = f"cal_F_trans{transitions}"
+            result = run_agents(
+                ["Model Based"], map_name, sr, gamma, num_ep, save, label,
+                seeds=SEEDS_CALIBRATION,
+            )
+            results_transitions[transitions] = result["Model Based"]
+    finally:
+        config.NUM_TRANSITIONS_MB = original_transitions
 
     if save:
-        _plot_line_single(results_traj, transitions,
-                          "Transiciones por iteración",
-                          "Cal. F: % Éxito vs Transiciones (Model Based)",
+        _plot_line_single(results_transitions, transition_counts,
+                          "Transiciones totales",
+                          "Cal. F: exito vs transiciones",
                           "calF_transitions.png", "Model Based")
-        _plot_line_single_time(results_traj, transitions,
-                               "Transiciones por iteración",
-                               "Cal. F: Tiempo vs Transiciones (Model Based)",
+        _plot_line_single_time(results_transitions, transition_counts,
+                               "Transiciones totales",
+                               "Cal. F: tiempo vs transiciones",
                                "calF_transitions_time.png", "Model Based")
 
-    print("\n→ Usa el mínimo de transiciones con el que el % éxito se estabiliza.")
-    return results_traj
+    return results_transitions
 
 
-# ── EXPERIMENTO PRINCIPAL ─────────────────────────────────────────────────────
+# -- Experimentos principales -------------------------------------------------
 
-def main_experiment(save=False):
-    """
-    Mapa (4x4, 8x8) x SR (0.33, 0.66, 1.0) x Algoritmo.
-    Usa 3 semillas y reporta media ± std para rigor estadístico.
-    Hipótesis:
-    - VI: óptimo en 4x4, escala mal en 8x8 (coste del MDP completo)
-    - MB: similar a VI pero más lento por la estimación desde experiencia
-    - QL: escala mejor, necesita más episodios en 8x8
-    - REINFORCE: más lento en converger, más afectado por SR bajo
-    - SR bajo afecta más a QL/REINFORCE/MB que a VI (lee el MDP real)
-    """
+def experiment_scaling(save=False, scaled_budget=False):
+    label = "presupuesto escalado" if scaled_budget else "presupuesto fijo"
     print("\n" + "=" * 55)
-    print("EXPERIMENTO PRINCIPAL — Mapa x SR x Algoritmo (3 semillas)")
+    print(f"EXPERIMENTO PRINCIPAL - Escalado del mapa ({label})")
     print("=" * 55)
 
-    maps          = ["4x4", "8x8"]
-    success_rates = [0.33, 0.66, 1.0]
-    gamma         = config.GAMMA
-    num_ep        = config.NUM_EPISODES
+    maps = list(config.SCALING_MAPS)
+    sr = config.EXPERIMENT_BASE_SUCCESS_RATE
+    gamma = config.GAMMA
+    base_episodes = config.NUM_EPISODES
+    base_transitions = config.NUM_TRANSITIONS_MB
+    sub_label = "scaled" if scaled_budget else "fixed"
 
-    all_results   = {m: {} for m in maps}
-    all_histories = {m: {} for m in maps}
+    all_results = {}
+    try:
+        for map_name in maps:
+            seeds = SEEDS_MAIN_LARGE if _is_large_map(map_name) else SEEDS_MAIN_SMALL
+            if scaled_budget:
+                size = int(map_name.split("x")[0])
+                scale = (size / 4) ** 2
+                num_ep = int(base_episodes * scale)
+                config.NUM_TRANSITIONS_MB = int(base_transitions * scale)
+            else:
+                num_ep = base_episodes
+                config.NUM_TRANSITIONS_MB = base_transitions
 
-    for map_name in maps:
-        for sr in success_rates:
-            print(f"\n  Mapa={map_name} | SR={sr} | γ={gamma} | ep={num_ep}")
-            res, hist = run_agents(ACTIVE_AGENTS, map_name, sr, gamma,
-                                   num_ep, save,
-                                   f"main_{map_name}_sr{sr}",
-                                   seeds=SEEDS)
-            all_results[map_name][sr]   = res
-            all_histories[map_name][sr] = hist
+            print(
+                f"\n  mapa={map_name} | episodios={num_ep} | "
+                f"transiciones_MB={config.NUM_TRANSITIONS_MB} | semillas={len(seeds)}"
+            )
+            exp_label = f"exp_scaling_{sub_label}_{map_name}"
+            all_results[map_name] = run_agents(
+                ACTIVE_AGENTS, map_name, sr, gamma, num_ep, save, exp_label,
+                seeds=seeds,
+            )
+    finally:
+        config.NUM_TRANSITIONS_MB = base_transitions
 
     if save:
-        for map_name in maps:
-            _plot_sr_per_map(all_results[map_name], success_rates,
-                             f"% Éxito y Tiempo vs SR — {map_name}",
-                             f"main_sr_{map_name}.png")
+        _plot_scaling(all_results, maps, sub_label)
+
+    return all_results
+
+
+def experiment_stochasticity(save=False):
+    print("\n" + "=" * 55)
+    print("EXPERIMENTO PRINCIPAL - Variacion de success_rate")
+    print("=" * 55)
+
+    maps = ["4x4", "8x8"]
+    success_rates = list(config.STOCHASTICITY_SUCCESS_RATES)
+    gamma = config.GAMMA
+    num_ep = config.NUM_EPISODES
+
+    all_results = {map_name: {} for map_name in maps}
+    for map_name in maps:
         for sr in success_rates:
-            _plot_map_comparison_bar(
-                {m: all_results[m][sr] for m in maps}, maps,
-                f"4x4 vs 8x8 — SR={sr}",
-                f"main_mapcomp_sr{sr}.png"
+            print(f"\n  mapa={map_name} | SR={sr:.3f}")
+            exp_label = f"exp_stochasticity_{map_name}_sr{_label_float(sr)}"
+            all_results[map_name][sr] = run_agents(
+                ACTIVE_AGENTS, map_name, sr, gamma, num_ep, save, exp_label,
+                seeds=SEEDS_MAIN_SMALL,
             )
-        for map_name in maps:
-            for sr in success_rates:
-                episodic_hist = {k: v for k, v in all_histories[map_name][sr].items()
-                                 if k in EPISODE_DEPENDENT and v}
-                if episodic_hist:
-                    _plot_curves(episodic_hist,
-                                 f"Curvas — {map_name} SR={sr}",
-                                 f"main_curves_{map_name}_sr{sr}.png")
-        _print_summary_table(all_results, maps, success_rates)
-        _print_time_table(all_results, maps, success_rates)
 
-    return all_results, all_histories
+    if save:
+        _plot_stochasticity(all_results, maps, success_rates)
+
+    return all_results
 
 
-# ── GRÁFICAS ──────────────────────────────────────────────────────────────────
+# -- Sanity checks ------------------------------------------------------------
+
+def sanity_checks(save=False):
+    print("\n" + "=" * 55)
+    print("SANITY CHECKS")
+    print("=" * 55)
+
+    failures = []
+
+    print("\n  Sanity-1: 4x4 determinista (is_slippery=False)")
+    with _temporary_config(
+        SLIPPERY=False,
+        EPSILON=config.SANITY_EPSILON,
+        EPSILON_DECAY=config.SANITY_EPSILON_DECAY,
+        REINFORCE_LR=config.SANITY_REINFORCE_LR,
+    ):
+        for agent_name in ACTIVE_AGENTS:
+            seed_results = []
+            for seed in SEEDS_MAIN_LARGE:
+                run = run_single(
+                    agent_name, "4x4", config.SANITY_DETERMINISTIC_SUCCESS_RATE,
+                    config.GAMMA, config.SANITY_NUM_EPISODES,
+                    agent_seed=seed, env_seed=seed,
+                    compute_oracle=False,
+                )
+                seed_results.append(run["eval_success_rate"])
+            mean_success = float(np.mean(seed_results))
+            ok = mean_success >= config.SANITY_SUCCESS_THRESHOLD
+            print(f"    {'OK' if ok else 'FAIL'} {agent_name}: {mean_success:.1f}%")
+            if not ok:
+                failures.append(f"Sanity-1 {agent_name}: {mean_success:.1f}%")
+
+    print("\n  Sanity-2: Model Based vs VI policy agreement")
+    with _temporary_config(
+        NUM_TRANSITIONS_MB=config.SANITY_MB_TRANSITIONS,
+        THETA_CONVERGENCE=config.SANITY_POLICY_THETA_CONVERGENCE,
+    ):
+        run = run_single(
+            "Model Based", "4x4", config.EXPERIMENT_BASE_SUCCESS_RATE, config.GAMMA, config.NUM_EPISODES,
+            agent_seed=42, env_seed=42,
+            compute_oracle=True,
+        )
+    agreement = run.get("eval_policy_agreement_vi")
+    ok = agreement is not None and agreement >= config.SANITY_POLICY_AGREEMENT_THRESHOLD
+    print(f"    {'OK' if ok else 'FAIL'} agreement={agreement}")
+    if not ok:
+        failures.append(f"Sanity-2 policy agreement: {agreement}")
+
+    print("\n  Sanity-3: Value Iteration convergence")
+    with _temporary_config(THETA_CONVERGENCE=config.SANITY_VI_THETA_CONVERGENCE):
+        run = run_single(
+            "Value Iteration", "4x4", config.EXPERIMENT_BASE_SUCCESS_RATE, config.GAMMA, config.NUM_EPISODES,
+            agent_seed=42, env_seed=42,
+            compute_oracle=False,
+        )
+    iterations = run.get("n_train_iterations")
+    ok = iterations is not None and iterations <= config.SANITY_VI_MAX_ITERATIONS
+    print(f"    {'OK' if ok else 'FAIL'} iterations={iterations}")
+    if not ok:
+        failures.append(f"Sanity-3 VI iterations: {iterations}")
+
+    if save:
+        exp_label = "sanity"
+        for failure in failures:
+            print(f"    fallo registrado: {failure}")
+
+    if failures:
+        print("\nFallos de sanity detectados:")
+        for failure in failures:
+            print(f"    - {failure}")
+        return False
+
+    print("\nTodos los sanity checks pasan.")
+    return True
+
+
+# -- Graficas -----------------------------------------------------------------
+
+def _histories_from_result(result_by_agent):
+    return {
+        agent: stats.get("history", [])
+        for agent, stats in result_by_agent.items()
+        if stats.get("history")
+    }
+
 
 def _plot_line(all_results, x_values, xlabel, title, filename):
-    """Gráfica de líneas con múltiples agentes."""
     agent_names = list(all_results[x_values[0]].keys())
     fig, ax = plt.subplots(figsize=(10, 5))
     for agent in agent_names:
+        vals = [all_results[x][agent]["eval_success_rate_mean"] for x in x_values]
+        stds = [all_results[x][agent]["eval_success_rate_std"] or 0 for x in x_values]
         color = COLORS.get(agent, "gray")
-        vals  = [all_results[x][agent]["success"] for x in x_values]
-        stds  = [all_results[x][agent].get("success_std", 0) for x in x_values]
         ax.plot(x_values, vals, marker="o", label=agent, color=color)
         ax.fill_between(x_values,
                         [v - s for v, s in zip(vals, stds)],
                         [v + s for v, s in zip(vals, stds)],
                         alpha=0.15, color=color)
-    ax.set(title=title, xlabel=xlabel, ylabel="% Éxito", ylim=(0, 110))
-    ax.legend()
-    ax.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, filename))
-    plt.close()
-
-
-def _plot_line_single(results, x_values, xlabel, title, filename, agent_name):
-    """Gráfica de línea para un único agente (calibraciones D, E, F)."""
-    color = COLORS.get(agent_name, "gray")
-    fig, ax = plt.subplots(figsize=(10, 5))
-    vals = [results[x]["success"] for x in x_values]
-    ax.plot(x_values, vals, marker="o", color=color, label=agent_name)
-    ax.set(title=title, xlabel=xlabel, ylabel="% Éxito", ylim=(0, 110))
-    ax.legend()
-    ax.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, filename))
-    plt.close()
-
-
-def _plot_line_single_time(results, x_values, xlabel, title, filename, agent_name):
-    """Gráfica de tiempo para un único agente."""
-    color = COLORS.get(agent_name, "gray")
-    fig, ax = plt.subplots(figsize=(10, 5))
-    vals = [results[x]["time"] for x in x_values]
-    ax.plot(x_values, vals, marker="s", color=color, label=agent_name)
-    ax.set(title=title, xlabel=xlabel, ylabel="Tiempo (s)")
+    ax.set(title=title, xlabel=xlabel, ylabel="% Exito", ylim=(0, 110))
     ax.legend()
     ax.grid(True)
     plt.tight_layout()
@@ -595,12 +855,11 @@ def _plot_line_single_time(results, x_values, xlabel, title, filename, agent_nam
 
 
 def _plot_time_line(all_results, x_values, xlabel, title, filename):
-    """Gráfica de tiempo con múltiples agentes."""
     agent_names = list(all_results[x_values[0]].keys())
     fig, ax = plt.subplots(figsize=(10, 5))
     for agent in agent_names:
+        vals = [all_results[x][agent]["total_train_time_s_mean"] for x in x_values]
         color = COLORS.get(agent, "gray")
-        vals  = [all_results[x][agent]["time"] for x in x_values]
         ax.plot(x_values, vals, marker="s", label=agent, color=color)
     ax.set(title=title, xlabel=xlabel, ylabel="Tiempo (s)")
     ax.legend()
@@ -610,18 +869,17 @@ def _plot_time_line(all_results, x_values, xlabel, title, filename):
     plt.close()
 
 
-def _plot_curves(histories_by_agent, title, filename):
-    """Curvas de aprendizaje suavizadas."""
+def _plot_line_single(results, x_values, xlabel, title, filename, agent_name):
     fig, ax = plt.subplots(figsize=(10, 5))
-    for name, history in histories_by_agent.items():
-        if not history:
-            continue
-        color = COLORS.get(name, "gray")
-        ax.plot(history, alpha=0.2, color=color)
-        smooth = (np.convolve(history, np.ones(100) / 100, mode="valid")
-                  if len(history) >= 100 else history)
-        ax.plot(smooth, label=name, color=color)
-    ax.set(title=title, xlabel="Episodios", ylabel="Recompensa")
+    vals = [results[x]["eval_success_rate_mean"] for x in x_values]
+    stds = [results[x]["eval_success_rate_std"] or 0 for x in x_values]
+    color = COLORS.get(agent_name, "gray")
+    ax.plot(x_values, vals, marker="o", color=color, label=agent_name)
+    ax.fill_between(x_values,
+                    [v - s for v, s in zip(vals, stds)],
+                    [v + s for v, s in zip(vals, stds)],
+                    alpha=0.15, color=color)
+    ax.set(title=title, xlabel=xlabel, ylabel="% Exito", ylim=(0, 110))
     ax.legend()
     ax.grid(True)
     plt.tight_layout()
@@ -629,146 +887,172 @@ def _plot_curves(histories_by_agent, title, filename):
     plt.close()
 
 
-def _plot_sr_per_map(results_by_sr, success_rates, title, filename):
-    """% Éxito y Tiempo vs SR para un mapa concreto."""
-    agent_names = list(results_by_sr[success_rates[0]].keys())
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle(title)
-    for ax, metric, ylabel in zip(axes,
-                                   ["success", "time"],
-                                   ["% Éxito", "Tiempo (s)"]):
+def _plot_line_single_time(results, x_values, xlabel, title, filename, agent_name):
+    fig, ax = plt.subplots(figsize=(10, 5))
+    vals = [results[x]["total_train_time_s_mean"] for x in x_values]
+    color = COLORS.get(agent_name, "gray")
+    ax.plot(x_values, vals, marker="s", color=color, label=agent_name)
+    ax.set(title=title, xlabel=xlabel, ylabel="Tiempo (s)")
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, filename))
+    plt.close()
+
+
+def _plot_curves(histories_by_agent, title, filename):
+    if not histories_by_agent:
+        return
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for name, history in histories_by_agent.items():
+        color = COLORS.get(name, "gray")
+        ax.plot(history, alpha=0.2, color=color)
+        smooth = (
+            np.convolve(history, np.ones(100) / 100, mode="valid")
+            if len(history) >= 100 else history
+        )
+        ax.plot(smooth, label=name, color=color)
+    ax.set(title=title, xlabel="Episodio / iteracion", ylabel="Recompensa / diff")
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, filename))
+    plt.close()
+
+
+def _plot_reward_bars(all_results, reward_labels, agents):
+    fig, axes = plt.subplots(1, len(agents), figsize=(6 * len(agents), 5))
+    if len(agents) == 1:
+        axes = [axes]
+    for ax, agent in zip(axes, agents):
+        vals = [
+            all_results[label][agent]["eval_success_rate_mean"]
+            for label in reward_labels
+        ]
+        bars = ax.bar(reward_labels, vals, color=["steelblue", "tomato", "seagreen"])
+        ax.set_title(agent)
+        ax.set_ylabel("% Exito")
+        ax.set_ylim(0, 110)
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 1,
+                    f"{val:.1f}%", ha="center", fontsize=9)
+        ax.grid(axis="y")
+    fig.suptitle("Cal. C: exito por reward_schedule")
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, "calC_reward.png"))
+    plt.close()
+
+
+def _plot_scaling(all_results, maps, sub_label):
+    x = np.arange(len(maps))
+    agent_names = list(all_results[maps[0]].keys())
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for agent in agent_names:
+        vals = [all_results[map_name][agent]["eval_success_rate_mean"] for map_name in maps]
+        stds = [all_results[map_name][agent]["eval_success_rate_std"] or 0 for map_name in maps]
+        color = COLORS.get(agent, "gray")
+        ax.plot(x, vals, marker="o", label=agent, color=color)
+        ax.fill_between(x,
+                        [v - s for v, s in zip(vals, stds)],
+                        [v + s for v, s in zip(vals, stds)],
+                        alpha=0.15, color=color)
+    ax.set_xticks(x)
+    ax.set_xticklabels(maps)
+    ax.set(title=f"Escalado ({sub_label}): exito vs mapa",
+           xlabel="Mapa", ylabel="% Exito", ylim=(0, 110))
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, f"exp_scaling_{sub_label}_success.png"))
+    plt.close()
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for agent in agent_names:
+        vals = [all_results[map_name][agent]["total_train_time_s_mean"] for map_name in maps]
+        ax.plot(x, vals, marker="s", label=agent, color=COLORS.get(agent, "gray"))
+    ax.set_xticks(x)
+    ax.set_xticklabels(maps)
+    ax.set(title=f"Escalado ({sub_label}): tiempo vs mapa",
+           xlabel="Mapa", ylabel="Tiempo (s)")
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, f"exp_scaling_{sub_label}_time.png"))
+    plt.close()
+
+
+def _plot_stochasticity(all_results, maps, success_rates):
+    for map_name in maps:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        agent_names = list(all_results[map_name][success_rates[0]].keys())
         for agent in agent_names:
-            vals  = [results_by_sr[sr][agent][metric] for sr in success_rates]
-            stds  = ([results_by_sr[sr][agent].get("success_std", 0)
-                      for sr in success_rates]
-                     if metric == "success" else [0] * len(success_rates))
+            vals = [
+                all_results[map_name][sr][agent]["eval_success_rate_mean"]
+                for sr in success_rates
+            ]
+            stds = [
+                all_results[map_name][sr][agent]["eval_success_rate_std"] or 0
+                for sr in success_rates
+            ]
             color = COLORS.get(agent, "gray")
             ax.plot(success_rates, vals, marker="o", label=agent, color=color)
-            if metric == "success":
-                ax.fill_between(success_rates,
-                                [v - s for v, s in zip(vals, stds)],
-                                [v + s for v, s in zip(vals, stds)],
-                                alpha=0.15, color=color)
-        ax.set(xlabel="Success Rate", ylabel=ylabel)
+            ax.fill_between(success_rates,
+                            [v - s for v, s in zip(vals, stds)],
+                            [v + s for v, s in zip(vals, stds)],
+                            alpha=0.15, color=color)
+        ax.set(title=f"Estocasticidad {map_name}: exito vs success_rate",
+               xlabel="success_rate", ylabel="% Exito", ylim=(0, 110))
         ax.set_xticks(success_rates)
-        if metric == "success":
-            ax.set_ylim(0, 110)
         ax.legend()
         ax.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, filename))
-    plt.close()
+        plt.tight_layout()
+        plt.savefig(os.path.join(PLOTS_DIR, f"exp_stochasticity_{map_name}.png"))
+        plt.close()
 
 
-def _plot_map_comparison_bar(results_by_map, maps, title, filename):
-    """Barras agrupadas 4x4 vs 8x8 por algoritmo."""
-    agent_names = list(results_by_map[maps[0]].keys())
-    x     = np.arange(len(agent_names))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for i, m in enumerate(maps):
-        vals = [results_by_map[m][a]["success"] for a in agent_names]
-        stds = [results_by_map[m][a].get("success_std", 0) for a in agent_names]
-        bars = ax.bar(x + i * width, vals, width, label=f"Mapa {m}",
-                      alpha=0.8, yerr=stds, capsize=4)
-        for bar, val in zip(bars, vals):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 2,
-                    f"{val:.0f}%", ha="center", fontsize=8)
-    ax.set(title=title, ylabel="% Éxito", ylim=(0, 120))
-    ax.set_xticks(x + width / 2)
-    ax.set_xticklabels(agent_names)
-    ax.legend()
-    ax.grid(axis="y")
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, filename))
-    plt.close()
+# -- CLI ----------------------------------------------------------------------
 
+def _build_runners():
+    return {
+        "sanity": sanity_checks,
+        "calibration_gamma": calibration_gamma,
+        "calibration_episodes": calibration_episodes,
+        "calibration_reward": calibration_reward,
+        "calibration_epsilon": calibration_epsilon,
+        "calibration_reinforce_lr": calibration_reinforce_lr,
+        "calibration_transitions": calibration_transitions,
+        "exp_scaling_fixed": lambda save: experiment_scaling(save, scaled_budget=False),
+        "exp_scaling_scaled": lambda save: experiment_scaling(save, scaled_budget=True),
+        "exp_stochasticity": experiment_stochasticity,
+    }
 
-def _print_summary_table(all_results, maps, success_rates):
-    print("\n" + "=" * 75)
-    print("TABLA RESUMEN — % Éxito (media ± std)")
-    print("=" * 75)
-    agent_names = list(all_results[maps[0]][success_rates[0]].keys())
-    print(f"{'Mapa':<6} {'SR':<6} " + " ".join(f"{a:<22}" for a in agent_names))
-    print("-" * 75)
-    for m in maps:
-        for sr in success_rates:
-            row = f"{m:<6} {sr:<6} "
-            for a in agent_names:
-                pct = all_results[m][sr][a]["success"]
-                std = all_results[m][sr][a].get("success_std", 0)
-                row += f"{pct:.1f}±{std:.1f}{'':>10}"
-            print(row)
-    print("=" * 75)
-
-
-def _print_time_table(all_results, maps, success_rates):
-    print("\n" + "=" * 75)
-    print("TABLA RESUMEN — Tiempo de entrenamiento (s)")
-    print("=" * 75)
-    agent_names = list(all_results[maps[0]][success_rates[0]].keys())
-    print(f"{'Mapa':<6} {'SR':<6} " + " ".join(f"{a:<22}" for a in agent_names))
-    print("-" * 75)
-    for m in maps:
-        for sr in success_rates:
-            row = f"{m:<6} {sr:<6} "
-            for a in agent_names:
-                row += f"{all_results[m][sr][a]['time']:<22.2f}"
-            print(row)
-    print("=" * 75)
-
-
-# ── CSV ───────────────────────────────────────────────────────────────────────
-
-def _init_csv():
-    with open(CSV_PATH, "w", newline="") as f:
-        csv.writer(f).writerow(["exp", "map_name", "success_rate", "gamma",
-                                 "num_episodes", "agent", "pct_success",
-                                 "avg_reward", "train_time_s"])
-
-
-def _append_csv(exp, map_name, sr, gamma, num_ep, agent, pct, avg_r, elapsed):
-    with open(CSV_PATH, "a", newline="") as f:
-        csv.writer(f).writerow([exp, map_name, sr, gamma, num_ep, agent,
-                                 f"{pct:.2f}", f"{avg_r:.4f}", f"{elapsed:.2f}"])
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    runners = _build_runners()
     parser = argparse.ArgumentParser(description="Experimentos FrozenLake")
     parser.add_argument(
-        "--exp", type=str, default="all",
-        choices=["all", "calibration_gamma", "calibration_episodes",
-                 "calibration_reward", "calibration_epsilon",
-                 "calibration_reinforce_lr", "calibration_transitions", "main"],
-        help="Experimento a ejecutar. 'all' ejecuta todos en orden."
+        "--exp",
+        type=str,
+        default="all",
+        choices=["all", *runners.keys()],
+        help="Experimento a ejecutar. 'all' ejecuta todos en orden.",
     )
     parser.add_argument(
-        "--save", action="store_true",
-        help="Guarda gráficas y CSV en results/"
+        "--save",
+        action="store_true",
+        help="Guarda CSVs y graficas en results/",
     )
     args = parser.parse_args()
 
     setup_dirs()
-    if args.save:
-        _init_csv()
-
-    runners = {
-        "calibration_gamma":        calibration_gamma,
-        "calibration_episodes":     calibration_episodes,
-        "calibration_reward":       calibration_reward,
-        "calibration_epsilon":      calibration_epsilon,
-        "calibration_reinforce_lr": calibration_reinforce_lr,
-        "calibration_transitions":  calibration_transitions,
-        "main":                     main_experiment,
-    }
 
     if args.exp == "all":
-        for fn in runners.values():
-            fn(save=args.save)
+        for runner in runners.values():
+            runner(save=args.save)
     else:
         runners[args.exp](save=args.save)
 
     if args.save:
-        print(f"\nResultados en '{RESULTS_DIR}/' | CSV en '{CSV_PATH}'")
+        print(f"\nResultados generados en '{RESULTS_DIR}/'.")

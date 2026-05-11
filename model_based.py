@@ -1,5 +1,12 @@
-import numpy as np
+# model_based.py
+# Changes: Model-Based Direct Estimation now reads its transition budget from
+# config.NUM_TRANSITIONS_MB and config.PLANNING_STEPS_PER_ITER, with
+# NUM_TRANSITIONS_MB interpreted as a total collection budget (Section 4.1).
+
 import collections
+
+import numpy as np
+
 import config
 
 
@@ -13,7 +20,7 @@ class ModelBasedAgent:
         self.state, _ = self.env.reset()
 
     def _play_random_steps(self, count):
-        """Explora aleatoriamente para estimar las funciones de transición y recompensa."""
+        """Explora aleatoriamente para estimar transiciones y recompensas."""
         for _ in range(count):
             action = self.env.action_space.sample()
             new_state, reward, is_done, truncated, _ = self.env.step(action)
@@ -31,14 +38,14 @@ class ModelBasedAgent:
             return 0.0
         action_value = 0.0
         for next_state, count in target_counts.items():
-            r = self.rewards[(state, action, next_state)]
+            reward = self.rewards[(state, action, next_state)]
             prob = count / total
-            action_value += prob * (r + self.gamma * self.V[next_state])
+            action_value += prob * (reward + self.gamma * self.V[next_state])
         return action_value
 
     def select_action(self, state, training=False):
         best_action = None
-        best_value = -float('inf')
+        best_value = -float("inf")
         for action in range(self.env.action_space.n):
             action_value = self.calc_action_value(state, action)
             if action_value > best_value:
@@ -47,37 +54,42 @@ class ModelBasedAgent:
         return best_action
 
     def _value_iteration_step(self):
-        """Una iteración de value iteration sobre el modelo estimado."""
-        max_diff = 0
+        """Una iteracion de value iteration sobre el modelo estimado."""
+        max_diff = 0.0
         for state in range(self.env.observation_space.n):
             state_values = [
                 self.calc_action_value(state, action)
                 for action in range(self.env.action_space.n)
             ]
-            new_V = max(state_values)
-            diff = abs(new_V - self.V[state])
+            new_value = max(state_values)
+            diff = abs(new_value - self.V[state])
             if diff > max_diff:
                 max_diff = diff
-            self.V[state] = new_V
+            self.V[state] = new_value
         return max_diff
 
     def train(self):
         """
-        Entrena el agente alternando exploración aleatoria e iteración de valor
-        hasta convergencia por THETA_CONVERGENCE.
-        A diferencia de Value Iteration, el MDP se estima desde experiencia,
-        no se lee directamente.
+        Entrena alternando exploracion aleatoria y value iteration.
+
+        config.NUM_TRANSITIONS_MB es el presupuesto total de transiciones
+        recolectadas durante todo el entrenamiento.
         """
-        # Exploración inicial para tener datos suficientes antes de iterar
-        self._play_random_steps(1000)
+        total_budget = max(0, int(config.NUM_TRANSITIONS_MB))
+        initial_transitions = min(1000, total_budget // 2)
+
+        self._play_random_steps(initial_transitions)
+        transitions_used = initial_transitions
 
         history = []
-        while True:
-            # Exploración adicional por iteración
-            self._play_random_steps(100)
+        while transitions_used < total_budget:
+            remaining = total_budget - transitions_used
+            chunk = min(config.PLANNING_STEPS_PER_ITER, remaining)
+            self._play_random_steps(chunk)
+            transitions_used += chunk
+
             max_diff = self._value_iteration_step()
             history.append(max_diff)
-
             if max_diff < config.THETA_CONVERGENCE:
                 break
 
@@ -85,8 +97,10 @@ class ModelBasedAgent:
 
     def get_policy(self):
         policy = np.zeros(self.env.observation_space.n, dtype=int)
-        for s in range(self.env.observation_space.n):
-            q_values = [self.calc_action_value(s, a)
-                        for a in range(self.env.action_space.n)]
-            policy[s] = np.argmax(q_values)
+        for state in range(self.env.observation_space.n):
+            q_values = [
+                self.calc_action_value(state, action)
+                for action in range(self.env.action_space.n)
+            ]
+            policy[state] = np.argmax(q_values)
         return policy

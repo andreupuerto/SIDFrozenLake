@@ -1,0 +1,647 @@
+% =====================================================================
+%  Práctica 2 — Sistemas Inteligentes Distribuidos
+%  Aprendizaje por refuerzo sobre FrozenLake-v1
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+% ---------- Paquetes ----------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-tabla]{babel}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue!60!black,
+  citecolor=black,
+  pdftitle={Práctica 2 SID — Aprendizaje por Refuerzo en FrozenLake-v1}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small SID}
+\fancyhead[R]{\small Práctica 2 — Aprendizaje por Refuerzo}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\titleformat{\section}{\Large\bfseries}{\thesection}{0.8em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.8em}{}
+
+\graphicspath{{figs/}}
+
+% =====================================================================
+\begin{document}
+
+% ---------- Portada ----------
+\begin{titlepage}
+  \centering
+  \vspace*{2cm}
+  {\Large \textsc{Sistemas Inteligentes Distribuidos}\par}
+  \vspace{0.8cm}
+  {\large Q2 2025--2026 \par}
+  \vspace{2cm}
+  {\Huge\bfseries Práctica 2 \par}
+  \vspace{0.6cm}
+  {\LARGE Análisis de algoritmos de aprendizaje por refuerzo sobre \textsc{FrozenLake-v1}\par}
+  \vspace{2.5cm}
+  \begin{tabular}{c}
+    \textbf{Autores}\\[0.4em]
+    Martí Checa\\
+    Óscar Nagl\\
+    Andreu Puerto
+  \end{tabular}
+  \vfill
+  {\large 11 de mayo de 2026 \par}
+\end{titlepage}
+
+% ---------- Índice ----------
+\tableofcontents
+\newpage
+
+% =====================================================================
+\section{Introducción}
+% =====================================================================
+
+En esta práctica se ha realizado un análisis exhaustivo y comparativo del rendimiento de diferentes algoritmos de Aprendizaje por Refuerzo (RL) aplicados al entorno \texttt{FrozenLake-v1} de Gymnasium. A diferencia de aproximaciones más sencillas trabajadas en la sesión introductoria de laboratorio, este estudio se centra estrictamente en la resolución del Proceso de Decisión de Markov (MDP) subyacente operando en su \emph{modo difícil}, caracterizado por una alta estocasticidad de las transiciones (\texttt{is\_slippery=True}) y, opcionalmente, por mapas de mayor tamaño generados procedimentalmente.
+
+Para llevar a cabo este análisis se ha implementado una batería de agentes que cubren los principales paradigmas del aprendizaje por refuerzo:
+\begin{itemize}
+  \item \textbf{Basados en modelo}: Iteración de Valor (con acceso completo a $P(s'|s,a)$) y Estimación Directa, que estima el modelo a partir de la experiencia.
+  \item \textbf{Basados en valor y experiencia (model-free)}: Q-Learning, que aproxima directamente la función acción-valor mediante diferencias temporales.
+  \item \textbf{Basado en gradiente de política}: REINFORCE, implementado como extensión para aportar una perspectiva adicional sobre la optimización directa de políticas.
+\end{itemize}
+
+El estudio se apoya en una arquitectura de software modular y orientada a la experimentación científica reproducible. El sistema consta de un núcleo de configuración centralizado (\texttt{config.py}), un gestor de entornos que permite la creación de mapas personalizados y la aplicación de esquemas de recompensa o \emph{reward shaping} (\texttt{main.py}), y un motor de experimentación masiva (\texttt{experiments.py}). Este último está diseñado para recolectar métricas avanzadas (tasa de éxito en evaluación, recompensa media, tiempos de convergencia y similitud con políticas oráculo) sometiendo a los agentes a diferentes tamaños de mapa (desde las cuadrículas estándar de $4\times 4$ y $8\times 8$ hasta dimensiones superiores de $10\times 10$ y $12\times 12$) y a distintos grados de incertidumbre modulando la probabilidad de éxito de las acciones (\texttt{success\_rate}).
+
+El presente documento recoge los resultados obtenidos, el análisis comparativo y las conclusiones del estudio, contextualizando cada observación con las propiedades teóricas vistas en las sesiones magistrales y de laboratorio.
+
+% =====================================================================
+\section{Descripción del entorno FrozenLake}
+% =====================================================================
+
+\subsection{Características del entorno}
+
+El entorno \texttt{FrozenLake-v1} simula la navegación de un agente sobre la superficie de un lago parcialmente congelado. El objetivo es trazar una ruta desde la casilla de inicio (S) hasta la meta (G), evitando caer en una serie de agujeros de hielo (H) distribuidos por el mapa. Sus características definitorias son:
+\begin{itemize}
+  \item \textbf{Espacio de observaciones (estados)}: espacio discreto representado por una cuadrícula. En este estudio se evalúa la escalabilidad partiendo de mapas base de $4\times 4$ (16 estados) y $8\times 8$ (64 estados), y se extiende mediante generación procedimental a resoluciones de $10\times 10$ (100 estados) y $12\times 12$ (144 estados).
+  \item \textbf{Espacio de acciones}: el agente dispone de cuatro movimientos discretos en cada estado (izquierda, abajo, derecha y arriba).
+  \item \textbf{Dinámica de transición}: el entorno opera con \texttt{is\_slippery=True}. Las transiciones no son deterministas: cuando el agente ejecuta una acción direccional, existe una probabilidad (modificable a través del parámetro \texttt{success\_rate}) de que se mueva efectivamente en la dirección deseada, y una probabilidad complementaria, repartida equitativamente, de resbalar perpendicularmente debido al hielo.
+  \item \textbf{Señal de recompensa}: la formulación original proporciona un \emph{feedback} extremadamente disperso (\emph{sparse reward}), otorgando 0 puntos por cualquier transición y $+1$ punto únicamente al alcanzar la meta de forma exitosa. Para profundizar en el análisis se ha implementado un sistema de esquemas de recompensa (\texttt{reward\_schedule}) que permite evaluar funciones alternativas, tales como pequeñas penalizaciones por paso o penalizaciones más severas por caer en los agujeros.
+  \item \textbf{Estado inicial y objetivo}: el agente parte siempre de la celda superior izquierda (S) y debe alcanzar la celda inferior derecha (G).
+\end{itemize}
+
+\subsection{Retos del entorno}
+
+La resolución de FrozenLake plantea desafíos técnicos significativos que pondrán a prueba las fortalezas y debilidades de cada algoritmo:
+\begin{itemize}
+  \item \textbf{Alta estocasticidad y gestión del riesgo}: la combinación de superficies resbaladizas y estados terminales negativos (agujeros) obliga a los algoritmos a ir más allá de la simple búsqueda del camino más corto. Los agentes deben aprender a equilibrar el riesgo y la eficiencia, buscando trayectorias que maximicen la probabilidad de supervivencia antes que la longitud geométrica de la ruta.
+  \item \textbf{Recompensa escasa y el problema del \emph{credit assignment}}: al recibir retroalimentación útil solo al final del episodio, los métodos basados puramente en experiencia (Q-Learning o REINFORCE) se enfrentan a la dificultad de asignar correctamente el valor a las acciones tempranas que llevaron a la victoria. Esto exige estrategias de exploración robustas ($\epsilon$-greedy) y tasas de aprendizaje muy bien calibradas.
+  \item \textbf{Explosión del espacio de estados}: al escalar el mapa a configuraciones de $10\times 10$ o $12\times 12$, la matriz de transiciones y el horizonte temporal requerido para alcanzar la meta crecen drásticamente. Esto supone una prueba de estrés directa para la eficiencia de los algoritmos: los métodos de planificación como Iteración de Valor sufrirán aumentos polinómicos en los tiempos de cómputo por iteración, mientras que los agentes \emph{model-free} necesitarán incrementar masivamente la recolección de muestras y ajustar mucho más finamente su exploración para lograr la convergencia.
+\end{itemize}
+
+% =====================================================================
+\section{Hipótesis y parámetros de experimentación}
+% =====================================================================
+
+\subsection{Hipótesis}
+
+Antes de realizar los experimentos se plantearon las siguientes hipótesis, derivadas de la teoría vista en clase y de los resultados obtenidos en el laboratorio introductorio:
+\begin{enumerate}
+  \item Los algoritmos basados en modelo (Iteración de Valor y Estimación Directa) convergerán más rápidamente que los basados en experiencia (Q-Learning y REINFORCE) cuando el modelo subyacente sea accesible o se pueda muestrear con suficiente densidad.
+  \item El factor de descuento $\gamma$ tendrá un impacto significativo en el comportamiento del agente, favoreciendo políticas más conservadoras y robustas al ruido cuando $\gamma\to 1$.
+  \item Q-Learning mostrará una sensibilidad alta a hiperparámetros como la tasa de aprendizaje y el coeficiente de exploración, y exhibirá comportamientos bimodales entre seeds cuando la exploración sea insuficiente.
+  \item REINFORCE requerirá un número de episodios sensiblemente mayor para converger y mostrará la mayor varianza inter-seed, debido a la elevada varianza intrínseca del estimador de gradiente Monte Carlo.
+  \item Al aumentar el tamaño del mapa, los métodos \emph{model-free} colapsarán antes que los métodos basados en modelo, ya que la \emph{sparse reward} amplifica el problema del \emph{credit assignment} en horizontes largos.
+  \item Al disminuir \texttt{success\_rate}, todos los algoritmos perderán rendimiento de forma monotónica; el método más resistente será Value Iteration, al no depender de la calidad del muestreo.
+\end{enumerate}
+
+\subsection{Parámetros y rangos de experimentación}
+
+Para todos los algoritmos se han evaluado los siguientes parámetros comunes:
+\begin{itemize}
+  \item \textbf{Factor de descuento} $\gamma \in \{0.9,\, 0.95,\, 0.99\}$.
+  \item \textbf{Tamaño del mapa}: $4\times 4,\, 8\times 8,\, 10\times 10,\, 12\times 12$ (los dos últimos generados procedimentalmente).
+  \item \textbf{Estocasticidad} (\texttt{success\_rate}): $\{0.20,\, 0.33,\, 0.60,\, 0.80,\, 1.00\}$, donde 1.00 corresponde a un entorno determinista y 0.20 a un entorno cuya probabilidad de moverse en la dirección deseada es menor que la de resbalar.
+  \item \textbf{Esquema de recompensa}: \emph{default} (sólo $+1$ en la meta), \emph{hole penalty} (penalización de $-1$ por caer en agujero) y \emph{step penalty} (penalización de $-0.01$ por paso).
+\end{itemize}
+Adicionalmente, para cada algoritmo se han analizado los hiperparámetros propios:
+\begin{itemize}
+  \item \textbf{Iteración de Valor}: umbral de convergencia $\theta = 10^{-6}$.
+  \item \textbf{Estimación Directa}: número de transiciones muestreadas $\in \{1000,\, 5000,\, 20000,\, 100000\}$.
+  \item \textbf{Q-Learning}: número de episodios $\in \{500,\,1000,\,2000,\,5000,\,10000,\,20000\}$, tasa de aprendizaje $\alpha \in \{0.05,\, 0.1,\, 0.3,\, 0.5\}$, coeficiente de exploración $\epsilon_0 \in \{0.3,\, 0.5,\, 0.8,\, 1.0\}$ con decaimiento exponencial.
+  \item \textbf{REINFORCE}: tasa de aprendizaje $\in \{10^{-3},\, 10^{-2},\, 5\!\cdot\!10^{-2},\, 10^{-1}\}$.
+\end{itemize}
+
+\subsection{Métricas de evaluación}
+
+Para evaluar la calidad de los entrenamientos y construir el análisis, se han empleado las siguientes métricas:
+\begin{itemize}
+  \item \textbf{Tasa de éxito en evaluación}: porcentaje de episodios en los que el agente alcanza la meta tras el entrenamiento, evaluado siempre con la política voraz (\emph{greedy}) sobre 1000 episodios.
+  \item \textbf{Recompensa media} y \textbf{número medio de pasos} por episodio.
+  \item \textbf{Tiempo de entrenamiento} y, en su caso, número de iteraciones internas hasta la convergencia.
+  \item \textbf{Optimalidad de la política}: porcentaje de estados en los que la política aprendida coincide con la de Value Iteration (\texttt{eval\_policy\_agreement\_vi}), usada como oráculo dado que VI converge demostrablemente a $\pi^\ast$.
+  \item \textbf{Varianza inter-seed}: todas las medias se reportan junto con su desviación típica sobre 5 seeds (3 seeds en los mapas $10\times 10$ y $12\times 12$ por coste computacional).
+\end{itemize}
+
+% =====================================================================
+\section{Estructura del código y decisiones de diseño}
+% =====================================================================
+
+Para facilitar la experimentación y asegurar la reproducibilidad de los resultados, se ha desarrollado una arquitectura de software modular. Esta separación de responsabilidades permite modificar algoritmos o configuraciones del entorno de forma independiente sin afectar al resto del sistema.
+
+\subsection{Módulo de configuración (\texttt{config.py})}
+
+Este archivo actúa como el cerebro de parámetros del proyecto: centraliza todos los hiperparámetros organizados en bloques (entorno, \emph{reward shaping} y algoritmos) para evitar los \emph{magic numbers} dispersos en el código. Aquí se definen valores críticos que garantizan la consistencia de las pruebas, tales como el factor de descuento $\gamma$, las tasas de aprendizaje $\alpha$, el coeficiente de exploración $\epsilon$ y los criterios de convergencia $\theta$.
+
+\subsection{Infraestructura de pruebas y entorno (\texttt{main.py})}
+
+Este fichero contiene la lógica fundamental para la creación y validación de los agentes. Implementa la \emph{factory} de entornos mediante la función \texttt{create\_env}, que soporta la generación de mapas de cualquier tamaño y la inyección de diferentes grados de estocasticidad a través del parámetro \texttt{success\_rate}. Además, proporciona la función \texttt{evaluate\_agent}, encargada de medir el porcentaje de éxito y la recompensa media de una política ya entrenada en modo de explotación. Sirve como banco de pruebas y depuración rápida antes de proceder a la experimentación masiva.
+
+\subsection{Motor de experimentación científica (\texttt{experiments.py})}
+
+Es el núcleo encargado de la ejecución automatizada de las pruebas. Está diseñado para lanzar baterías de ejecuciones de forma sistemática, abarcando desde las calibraciones iniciales de hiperparámetros hasta los experimentos principales de escalabilidad y varianza inter-seed. Este módulo garantiza el rigor empírico permitiendo guardar los resultados numéricos estructurados en archivos CSV y generar automáticamente las gráficas de aprendizaje y las trazas necesarias para el análisis posterior.
+
+% =====================================================================
+\section{Iteración de Valor}
+% =====================================================================
+
+La Iteración de Valor (\emph{Value Iteration}, VI) es un método de aprendizaje por refuerzo basado en modelo que determina la política óptima mediante la convergencia iterativa de la función de valor. A diferencia de los métodos basados en experiencia, este algoritmo requiere acceso completo al modelo del entorno, esto es, a las probabilidades de transición $P(s'|s,a)$ y a las recompensas $R(s,a,s')$.
+
+\subsection{Fundamentos teóricos}
+
+El algoritmo se basa en el principio de optimalidad de Bellman, que establece que la función de valor óptima de un MDP satisface la ecuación
+\begin{equation}
+  V^{\ast}(s) \;=\; \max_{a}\; \sum_{s'} P(s'|s,a)\!\left[\,R(s,a,s') + \gamma\, V^{\ast}(s')\,\right],
+  \label{eq:bellman}
+\end{equation}
+donde $V^{\ast}(s)$ es el valor óptimo del estado $s$, $P(s'|s,a)$ es la probabilidad de transición al ejecutar la acción $a$ en $s$, $R(s,a,s')$ es la recompensa asociada y $\gamma\in[0,1)$ es el factor de descuento.
+
+El algoritmo actualiza iterativamente la función de valor mediante la operación de Bellman hasta que el residuo $\lVert V_{k+1}-V_k\rVert_\infty$ es menor que un umbral $\theta$. La política óptima se deriva entonces seleccionando, para cada estado, la acción que maximiza el valor esperado:
+\begin{equation}
+  \pi^{\ast}(s) \;=\; \arg\max_{a}\; \sum_{s'} P(s'|s,a)\!\left[\,R(s,a,s') + \gamma\, V^{\ast}(s')\,\right].
+  \label{eq:greedy}
+\end{equation}
+
+Dado que la operación de Bellman es una contracción de coeficiente $\gamma$ en la norma infinito, la convergencia a $V^{\ast}$ está matemáticamente garantizada para cualquier MDP con recompensas acotadas y $\gamma<1$.
+
+\subsection{Implementación}
+
+El agente accede directamente a la matriz de transiciones provista por el entorno mediante \texttt{env.unwrapped.P}. Respecto a la base desarrollada en el laboratorio, se ha mejorado el criterio de parada introduciendo un umbral estricto de convergencia $\theta = 10^{-6}$. El bucle de entrenamiento se detiene únicamente cuando la máxima actualización sufrida por cualquier estado es inferior a dicho umbral, lo que asegura la obtención de una política prácticamente óptima con el menor coste computacional posible.
+
+\subsection{Resultados experimentales}
+
+Los experimentos realizados con Value Iteration han permitido analizar su comportamiento como agente \emph{oráculo} bajo las distintas configuraciones de mapa y estocasticidad. La Figura~\ref{fig:vi_iters} muestra el número de iteraciones internas hasta la convergencia en función de \texttt{success\_rate} y del tamaño del mapa.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.80\linewidth]{fig_vi_iters.png}
+  \caption{Iteraciones internas de Value Iteration hasta satisfacer $\theta = 10^{-6}$, en función de \texttt{success\_rate} y del tamaño del mapa. La estocasticidad y el tamaño aumentan el número de barridos necesarios, en consonancia con el factor de contracción $\gamma$.}
+  \label{fig:vi_iters}
+\end{figure}
+
+Como puede observarse, el número de iteraciones crece tanto con la estocasticidad (de 7 con \texttt{sr}=1.0 a 228 con \texttt{sr}=0.33 en $4\times 4$) como con el tamaño del mapa (de 228 en $4\times 4$ a 253 en $8\times 8$ con \texttt{sr}=0.33). Este comportamiento es coherente con la teoría: a mayor estocasticidad, la magnitud de las actualizaciones decae más lentamente entre iteraciones, ya que el operador de Bellman tarda más en reducir el residuo en mapas con caminos esperados largos. A pesar de ello, los tiempos absolutos permanecen muy bajos: $0.025\,$s en $4\times 4$, $0.12\,$s en $8\times 8$ y $0.25\,$s en $12\times 12$, lo que demuestra que VI escala polinomialmente con $|S|\cdot|A|$ tal y como predice la teoría, no exponencialmente.
+
+La Figura~\ref{fig:vi_estoc_4x4_8x8} compara la tasa de éxito de VI con la de los demás algoritmos para mapas de $4\times 4$ y $8\times 8$ a través del rango completo de \texttt{success\_rate}.
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[t]{0.495\textwidth}
+    \includegraphics[width=\linewidth]{fig_estocasticidad_4x4.png}
+    \caption{Mapa $4\times 4$.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.495\textwidth}
+    \includegraphics[width=\linewidth]{fig_estocasticidad_8x8.png}
+    \caption{Mapa $8\times 8$.}
+  \end{subfigure}
+  \caption{Tasa de éxito en evaluación por algoritmo y nivel de estocasticidad. Las barras muestran la media sobre 5 seeds y las barras de error la desviación típica. VI mantiene tasas de éxito altas en todos los regímenes; los métodos \emph{model-free} colapsan en $8\times 8$ para \texttt{success\_rate}$\leq 0.6$.}
+  \label{fig:vi_estoc_4x4_8x8}
+\end{figure}
+
+\subsection{Análisis del efecto de los parámetros}
+
+\paragraph{Factor de descuento ($\gamma$).} En el mapa $4\times 4$ con \texttt{sr}=0.33, la tasa de éxito de VI es prácticamente independiente de $\gamma$ (73.1\,\% con $\gamma$=0.90, 73.1\,\% con 0.95 y 73.0\,\% con 0.99). Esto se debe a que la ordenación relativa de las acciones bajo la ecuación de Bellman se mantiene invariante para los valores de $\gamma$ considerados, por lo que la política resultante converge al mismo $\arg\max$ en todos los casos. Lo que sí cambia significativamente es el número de iteraciones internas: 60 con $\gamma$=0.9, 98 con 0.95 y 228 con 0.99, en línea con el efecto del factor de contracción.
+
+\paragraph{Umbral de convergencia ($\theta$).} Aunque no se ha barrido explícitamente en el experimento principal, el valor fijado $\theta=10^{-6}$ garantiza una precisión muy superior a la requerida para que la política voraz sea estable. Valores más laxos ($\theta=10^{-3}$, por ejemplo) habrían reducido marginalmente el tiempo de cómputo, pero a riesgo de obtener políticas subóptimas en mapas grandes.
+
+\paragraph{Esquema de recompensa.} VI no se ha sometido al barrido de \emph{reward shaping} ya que su política óptima depende únicamente de la geometría del MDP y no requiere ajustes de exploración. No obstante, en los experimentos auxiliares se observa que las funciones \emph{hole penalty} y \emph{step penalty} apenas alteran su política en mapas pequeños, dado que el agente ya evita los agujeros por construcción al maximizar el valor esperado.
+
+\subsection{Fortalezas y debilidades}
+
+\paragraph{Fortalezas.}
+\begin{enumerate}
+  \item \textbf{Convergencia garantizada}: el operador de Bellman es una contracción y la convergencia a $\pi^{\ast}$ está demostrada matemáticamente para todo $\gamma<1$.
+  \item \textbf{Baja varianza inter-seed}: en todas las configuraciones de $4\times 4$ la desviación típica es $\leq 1.5$ puntos porcentuales, ya que la política depende únicamente del modelo y no de trayectorias muestreadas.
+  \item \textbf{Inmunidad al cuello de botella exploratorio}: en $8\times 8$ con \texttt{success\_rate}=0.66 mantiene un 89.4\,\% de éxito, mientras que todos los métodos \emph{model-free} caen al 0\,\% por la combinación de \emph{sparse reward} y exploración insuficiente.
+  \item \textbf{Eficiencia computacional}: los tiempos son despreciables comparados con los algoritmos \emph{model-free} (10--100$\times$ más rápido) y escalan polinómicamente con $|S|\cdot|A|$.
+\end{enumerate}
+
+\paragraph{Debilidades.}
+\begin{enumerate}
+  \item \textbf{Requiere modelo completo}: necesita conocer las probabilidades de transición y las recompensas, lo cual no siempre es posible en aplicaciones del mundo real.
+  \item \textbf{Maldición de la dimensionalidad}: aunque escala polinomialmente, en MDP con espacios de estados continuos o muy grandes la representación tabular se vuelve inviable.
+  \item \textbf{Limitada por la propia dificultad del MDP}: en mapas $10\times 10$ y $12\times 12$ con \texttt{sr}=0.33, incluso la política óptima alcanza sólo el 15--20\,\% de éxito, debido a que la probabilidad acumulada de caer en un agujero por resbalones tiende a 1 a medida que el camino esperado crece.
+\end{enumerate}
+
+% =====================================================================
+\section{Estimación Directa}
+% =====================================================================
+
+La Estimación Directa (\emph{Model-Based Direct Estimation}, MB) es un método basado en modelo que, a diferencia de Value Iteration, no asume conocido el MDP sino que lo construye a partir de la experiencia muestreada.
+
+\subsection{Fundamentos teóricos}
+
+El algoritmo se descompone en tres componentes principales:
+\begin{enumerate}
+  \item \textbf{Aprendizaje del modelo}: el agente recoge transiciones $(s,a,r,s')$ mediante una política exploratoria (típicamente uniforme aleatoria o $\epsilon$-greedy) y estima
+  $$\hat{P}(s'|s,a) = \frac{N(s,a,s')}{N(s,a)},\qquad \hat{R}(s,a,s') = \frac{\sum r_{(s,a,s')}}{N(s,a,s')},$$
+  donde $N(\cdot)$ son conteos empíricos.
+  \item \textbf{Planificación}: aplicando el modelo estimado, el agente realiza Iteración de Valor (u otra técnica de programación dinámica) para derivar una política sobre los estados visitados.
+  \item \textbf{Exploración y explotación}: en versiones más sofisticadas, el agente intercala fases de muestreo y planificación; en nuestra implementación se ha optado por una fase explícita de muestreo seguida de una fase de planificación, lo cual simplifica el análisis sin perder generalidad.
+\end{enumerate}
+
+La actualización de los valores sigue una versión adaptada de la ecuación de Bellman:
+\begin{equation}
+  Q(s,a) \;=\; \sum_{s'} \hat{P}(s'|s,a)\!\left[\hat{R}(s,a,s') + \gamma\,\max_{a'} Q(s',a')\right].
+  \label{eq:mb-bellman}
+\end{equation}
+
+Cuando $N(s,a)\to\infty$, las estimaciones $\hat{P}$ y $\hat{R}$ convergen a las verdaderas $P$ y $R$, y la solución de \eqref{eq:mb-bellman} converge a la de \eqref{eq:bellman}.
+
+\subsection{Implementación}
+
+El algoritmo implementado divide su ejecución en dos fases. Inicialmente ejecuta una fase de exploración aleatoria, controlada por la función \texttt{\_play\_random\_steps}, con el objetivo de poblar un modelo interno apoyado en diccionarios de frecuencias de transiciones. Una vez consumido su presupuesto de exploración, transita a una fase de planificación donde aplica Iteración de Valor sobre su modelo estimado para derivar la política final. El parámetro \texttt{num\_transitions\_mb} controla el presupuesto de muestreo y se ha barrido en el rango $\{10^3,\, 5\!\cdot\!10^3,\, 2\!\cdot\!10^4,\, 10^5\}$ para estudiar el trade-off muestras vs.\ calidad.
+
+\subsection{Resultados experimentales}
+
+Los resultados del MB son fuertemente dependientes de la calidad del muestreo. La Figura~\ref{fig:mb_trans} muestra el efecto del número de transiciones sobre la tasa de éxito en el mapa $4\times 4$ con \texttt{sr}=0.33.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{fig_mb_trans.png}
+  \caption{Efecto del presupuesto de muestreo en Estimación Directa. Con 1000 transiciones el agente apenas alcanza el 9\,\% de éxito; el rendimiento mejora bruscamente con 5000 transiciones y se satura a partir de $2\!\cdot\!10^4$.}
+  \label{fig:mb_trans}
+\end{figure}
+
+Con 1000 transiciones la media cae al 9\,\%; con 5000 se sitúa en torno al 58--59\,\%; con $10^5$ alcanza el 59.8\,\%. El retorno decreciente a partir de 5000 transiciones sugiere que el cuello de botella en $4\times 4$ estocástico no es la cantidad de muestras sino la \emph{cobertura} del espacio: ciertos pares $(s,a)$ cercanos a la meta se visitan con muy baja probabilidad bajo una política aleatoria, y por mucho que aumentemos el presupuesto, esos pares permanecen subrepresentados.
+
+La Figura~\ref{fig:vi_estoc_4x4_8x8} también incluye el rendimiento de MB en el barrido principal de estocasticidad. Cabe destacar dos observaciones:
+\begin{itemize}
+  \item \textbf{Superioridad sobre Q-Learning con baja estocasticidad}. En $4\times 4$ con \texttt{sr}=0.80, MB alcanza un 83.1\,\% frente al 72.6\,\% de Q-Learning. Esto es coherente con la teoría: cuando la dinámica es relativamente simple y la cobertura es suficiente, un método basado en modelo aprovecha mejor cada transición observada (\emph{sample efficiency} superior) que un método TD que actualiza una sola celda por paso.
+  \item \textbf{Degradación pronunciada con alta estocasticidad}. Con \texttt{sr}=0.33, la media baja al 58.5\,\% con desviación típica de $\sim$33 puntos. La estimación de $\hat{P}$ requiere un número combinatoriamente mayor de visitas a cada par $(s,a)$ cuando la transición es muy ruidosa, y con un presupuesto fijo de trayectorias el modelo estimado pierde precisión.
+  \item \textbf{Colapso en mapas grandes}. En $8\times 8$, MB cae al 0\,\% para casi todas las configuraciones; la fase de muestreo aleatorio no consigue alcanzar la meta con suficiente frecuencia como para que el modelo aprenda recompensas positivas.
+\end{itemize}
+
+La Figura~\ref{fig:opt_mb} muestra la optimalidad de la política (\texttt{eval\_policy\_agreement\_vi}) en $4\times 4$. MB coincide con la política de VI en un 88--96\,\% de los estados cuando la estocasticidad es moderada o baja, lo que confirma que su mecanismo de planificación recupera correctamente la dinámica cuando se le proporciona suficiente cobertura.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth]{fig_optimalidad.png}
+  \caption{Optimalidad de la política: porcentaje de estados en los que el método aprendido coincide con la política de Value Iteration. En $4\times 4$, MB es el método que más se aproxima a la política óptima; en $8\times 8$ todos los métodos pierden el control.}
+  \label{fig:opt_mb}
+\end{figure}
+
+\subsection{Análisis del efecto de los parámetros}
+
+\paragraph{Factor de descuento ($\gamma$).} En MB, $\gamma$ se aplica sobre el modelo estimado, por lo que su efecto en mapas pequeños es prácticamente el mismo que en VI: la política converge al mismo argmax mientras $\gamma\in[0.9,\,0.99]$.
+
+\paragraph{Número de transiciones de muestreo.} Es el parámetro más sensible del algoritmo. Con valores bajos ($\leq 10^3$), el modelo estimado es tan pobre que la planificación produce una política casi aleatoria. A partir de $5\!\cdot\!10^3$ se observa el retorno decreciente característico de los estimadores frecuentistas.
+
+\paragraph{Esquema de recompensa.} Al ser un método de planificación, MB hereda en buena medida la robustez de VI frente a cambios en la señal de recompensa: penalizaciones moderadas por agujero apenas modifican la política, mientras que penalizaciones por paso pueden inducir \emph{reward hacking} si son demasiado grandes (el agente prefiere acabar el episodio cayendo en un agujero a seguir pagando coste por paso).
+
+\subsection{Fortalezas y debilidades}
+
+\paragraph{Fortalezas.}
+\begin{enumerate}
+  \item \textbf{No requiere modelo a priori}: aprende la dinámica a partir de la experiencia, lo que lo hace aplicable en escenarios en los que no se dispone del MDP de antemano.
+  \item \textbf{Buena \emph{sample efficiency} en mapas pequeños}: aprovecha cada transición observada mediante la posterior planificación.
+  \item \textbf{Políticas muy próximas a $\pi^{\ast}$ cuando la cobertura es suficiente}: 88--96\,\% de \emph{policy agreement} con VI en $4\times 4$.
+\end{enumerate}
+
+\paragraph{Debilidades.}
+\begin{enumerate}
+  \item \textbf{Dependencia crítica de la cobertura}: en mapas grandes o con \emph{sparse reward}, una exploración aleatoria no garantiza visitar suficientes pares $(s,a)$ relevantes.
+  \item \textbf{Sensibilidad a la estocasticidad}: con \texttt{sr}=0.33 la varianza inter-seed sube a $\sim$33 puntos porcentuales.
+  \item \textbf{Coste de almacenamiento}: la representación tabular de $\hat{P}$ crece como $O(|S|^2\,|A|)$, lo que es problemático en mapas grandes.
+\end{enumerate}
+
+% =====================================================================
+\section{Q-Learning}
+% =====================================================================
+
+Q-Learning es un algoritmo \emph{model-free} fundamentado en diferencias temporales (TD). A diferencia de los métodos basados en modelo, aprende directamente la función acción-valor óptima $Q^{\ast}(s,a)$ a partir de la interacción con el entorno, sin necesidad de estimar la dinámica.
+
+\subsection{Fundamentos teóricos}
+
+Q-Learning aproxima la función acción-valor óptima mediante actualizaciones iterativas en diferencias temporales:
+\begin{equation}
+  Q(s,a) \;\leftarrow\; Q(s,a) + \alpha\!\left[\,r + \gamma\,\max_{a'} Q(s',a') - Q(s,a)\,\right],
+  \label{eq:qlearning}
+\end{equation}
+donde $\alpha\in(0,1]$ es la tasa de aprendizaje, $r$ es la recompensa inmediata recibida y $s'$ el estado siguiente. La política $\epsilon$-greedy decide la acción a tomar en cada paso: con probabilidad $\epsilon$ se explora uniformemente y con probabilidad $1-\epsilon$ se explota el $\arg\max_{a} Q(s,a)$ actual.
+
+Q-Learning es \emph{off-policy}: las actualizaciones de $Q$ se hacen como si el agente siguiera la política óptima, aunque en realidad esté siguiendo la política $\epsilon$-greedy. Bajo condiciones de Robbins--Monro
+$$\sum_k \alpha_k = \infty,\quad \sum_k \alpha_k^2 < \infty,$$
+y visitando infinitas veces cada par $(s,a)$, la convergencia a $Q^{\ast}$ está garantizada.
+
+\subsection{Implementación}
+
+El agente mantiene una tabla $Q$ actualizada paso a paso. Para gestionar el dilema exploración--explotación se utiliza una estrategia $\epsilon$-greedy con \textbf{decaimiento exponencial} de $\epsilon$ tras cada episodio: $\epsilon_{t+1} = \max(\epsilon_{\min},\, \epsilon_t \cdot d_\epsilon)$, con $\epsilon_{\min}=0.01$ y $d_\epsilon\in[0.99,\,0.999]$. Análogamente, se ha incorporado un decaimiento opcional de $\alpha$ para amortiguar la varianza al final del entrenamiento.
+
+\subsection{Resultados experimentales}
+
+\paragraph{Efecto del número de episodios.} La Figura~\ref{fig:episodios} muestra la curva de convergencia de Q-Learning y REINFORCE en función del número de episodios. Q-Learning satura su tabla $Q$ alrededor de los 5000 episodios, y a partir de ahí las mejoras son marginales: la propagación de Bellman ha alcanzado el límite que permite el $\epsilon$ actual.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{fig_episodios.png}
+  \caption{Efecto del número de episodios de entrenamiento en Q-Learning y REINFORCE (mapa $4\times 4$, \texttt{sr}=0.33). Q-Learning satura en torno a 5000 episodios; REINFORCE sigue mejorando lentamente hasta los 20\,000 episodios.}
+  \label{fig:episodios}
+\end{figure}
+
+\paragraph{Efecto del coeficiente de exploración $\epsilon$.} La Figura~\ref{fig:epsilon} muestra el rendimiento de Q-Learning con diferentes valores de $\epsilon_0$. Es particularmente didáctico observar la bimodalidad para $\epsilon_0=0.3$: cuatro de las cinco seeds quedan al 0\,\% y una alcanza el 74\,\%, lo que se traduce en una desviación típica de casi 30 puntos. Esto refleja directamente la condición de optimalidad del algoritmo: cada par $(s,a)$ debe visitarse un número infinito de veces. Con $\epsilon$ bajo y decaimiento agresivo, el agente se vuelve voraz sobre una tabla $Q$ casi vacía antes de descubrir la meta, y queda atrapado en una política inicial subóptima. $\epsilon_0=0.8$ proporciona el equilibrio óptimo entre exploración suficiente y explotación de la información aprendida (73.3\,\% con desviación típica de tan sólo 1.9 puntos).
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.75\linewidth]{fig_epsilon.png}
+  \caption{Q-Learning: efecto del coeficiente de exploración inicial $\epsilon_0$. Cada punto corresponde a una seed; el rombo negro indica la media y barras la desviación típica. Con $\epsilon_0=0.3$ se observa una clara bimodalidad.}
+  \label{fig:epsilon}
+\end{figure}
+
+\paragraph{Efecto de la tasa de aprendizaje $\alpha$.} La Figura~\ref{fig:alpha} muestra que $\alpha=0.10$ es el punto dulce. Con $\alpha=0.05$ la propagación de Bellman es demasiado lenta para alcanzar la convergencia en el número de episodios disponibles; con $\alpha\geq 0.30$, el algoritmo asigna demasiado peso a la muestra más reciente y oscila ante la estocasticidad del entorno, perdiendo la estabilidad necesaria para acumular información a largo plazo. Esto valida empíricamente la condición de Robbins--Monro vista en teoría: tasas demasiado altas violan la segunda condición y rompen la convergencia.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.75\linewidth]{fig_alpha.png}
+  \caption{Q-Learning: efecto de la tasa de aprendizaje $\alpha$ en la tasa de éxito. El valor óptimo se sitúa en $\alpha=0.1$.}
+  \label{fig:alpha}
+\end{figure}
+
+\paragraph{Efecto del factor de descuento $\gamma$.} Contrariamente a VI, Q-Learning sí muestra una preferencia clara por $\gamma$ alto: la tasa de éxito sube de 62.5\,\% con $\gamma=0.9$ a 71.6\,\% con $\gamma=0.99$ (Figura~\ref{fig:gamma}). En un entorno donde la meta dista varios pasos del inicio y hay alta probabilidad de resbalar, un $\gamma$ bajo penaliza desproporcionadamente las trayectorias largas y empuja al agente hacia políticas miopes que ignoran la recompensa final.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.80\linewidth]{fig_gamma.png}
+  \caption{Efecto de $\gamma$ sobre el rendimiento de los cuatro algoritmos (mapa $4\times 4$, \texttt{sr}=0.33). VI es invariante a $\gamma$ en este régimen; Q-Learning y REINFORCE muestran preferencia por valores altos.}
+  \label{fig:gamma}
+\end{figure}
+
+\paragraph{Efecto del esquema de recompensa.} La Figura~\ref{fig:reward_shaping} muestra el impacto de las tres variantes de \emph{reward shaping} en Q-Learning y REINFORCE. La penalización por agujero (\emph{hole penalty}) mejora marginalmente Q-Learning (de 68 a 70\,\%) al proporcionar una señal informativa en las transiciones a estados terminales negativos, acelerando la propagación de utilidades. La penalización por paso (\emph{step penalty}), en cambio, degrada el rendimiento a 52.7\,\%: en un entorno con horizontes largos por la estocasticidad, la penalización por paso convierte cualquier camino largo en una pérdida acumulada, y aparece un fenómeno clásico de \emph{reward hacking}: el agente prefiere terminar el episodio cayendo en un agujero a seguir sumando penalizaciones por paso.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.80\linewidth]{fig_reward_shaping.png}
+  \caption{Efecto del esquema de recompensa en Q-Learning y REINFORCE (mapa $4\times 4$, \texttt{sr}=0.33). El \emph{step penalty} colapsa a ambos algoritmos.}
+  \label{fig:reward_shaping}
+\end{figure}
+
+\subsection{Análisis del efecto de los parámetros}
+
+\paragraph{Tasa de aprendizaje $\alpha$.} El valor óptimo se sitúa de forma robusta en $\alpha=0.1$ para horizontes moderados. Valores más bajos (0.05) producen aprendizajes demasiado lentos, y valores más altos (0.3--0.5) violan las condiciones de Robbins--Monro y desestabilizan la tabla $Q$. En contextos más complejos, incorporar un decaimiento progresivo $\alpha_{t+1} = \alpha_t \cdot d_\alpha$ podría ayudar a estabilizar la fase final del entrenamiento, aunque en nuestros experimentos su efecto fue marginal.
+
+\paragraph{Coeficiente de exploración $\epsilon$.} La evolución del rendimiento bajo diferentes valores de $\epsilon$ y de su decaimiento evidencia la importancia de una estrategia de exploración adecuada. Si la fase exploratoria es demasiado corta, el agente queda atrapado en óptimos locales sobre una tabla $Q$ todavía no informativa. Un valor $\epsilon_0=0.8$ con decaimiento $d_\epsilon=0.999$ ha demostrado ser el más robusto en nuestros experimentos.
+
+\paragraph{Factor de descuento $\gamma$.} En FrozenLake, donde la recompensa es escasa y diferida, los valores altos de $\gamma$ son claramente preferibles. La diferencia es de $\sim$9 puntos porcentuales entre $\gamma=0.9$ y $\gamma=0.99$, una magnitud sustancialmente mayor que la observada en VI.
+
+\paragraph{Número de episodios.} Q-Learning satura a partir de 5000 episodios en $4\times 4$, pero en mapas mayores el número necesario crece exponencialmente: en $8\times 8$ con \emph{sparse reward}, ni siquiera 20\,000 episodios bastan para que el agente alcance la meta con frecuencia suficiente.
+
+\subsection{Fortalezas y debilidades}
+
+\paragraph{Fortalezas.}
+\begin{enumerate}
+  \item \textbf{No requiere modelo del entorno}, lo que lo hace aplicable a problemas reales donde la dinámica es desconocida o intratable.
+  \item \textbf{Actualización TD continua}, sin necesidad de esperar al final del episodio (a diferencia de los métodos Monte Carlo como REINFORCE).
+  \item \textbf{Aprendizaje \emph{off-policy}}: aprende sobre la política óptima mientras explora con otra. Esto permite reutilizar experiencias bajo distintas políticas y, en extensiones modernas, usar \emph{replay buffers}.
+  \item \textbf{Robustez razonable con hiperparámetros bien calibrados}: con $\gamma=0.99$, $\alpha=0.1$ y $\epsilon_0=0.8$ alcanza tasas del 73\,\% en $4\times 4$ con desviación típica baja.
+\end{enumerate}
+
+\paragraph{Debilidades.}
+\begin{enumerate}
+  \item \textbf{Alta sensibilidad a hiperparámetros}: el rendimiento se ve fuertemente afectado por la selección de $\gamma$, $\alpha$ y $\epsilon$ y su decaimiento.
+  \item \textbf{Bimodalidad inter-seed} con $\epsilon$ bajo: la convergencia depende fuertemente de la suerte con que la fase exploratoria descubra la meta.
+  \item \textbf{Convergencia lenta en mapas grandes}: en $8\times 8$ con \emph{sparse reward} colapsa por completo, incluso con 20\,000 episodios.
+  \item \textbf{No garantiza la política óptima en la práctica}: aunque teóricamente converge, errores acumulados en las actualizaciones pueden derivar en políticas subóptimas si la cobertura del estado no es suficiente.
+\end{enumerate}
+
+% =====================================================================
+\section{REINFORCE}
+% =====================================================================
+
+REINFORCE es un algoritmo de gradiente de política Monte Carlo que optimiza directamente una política parametrizada $\pi_\theta(a|s)$ sin necesidad de estimar una función de valor explícita.
+
+\subsection{Fundamentos teóricos}
+
+A diferencia de los métodos orientados a estimar el valor de los estados, REINFORCE pertenece al paradigma de optimización directa. Parametriza la política $\pi_\theta(a|s)$ y ajusta sus parámetros mediante ascenso de gradiente. Su objetivo es maximizar el retorno esperado
+\begin{equation}
+  J(\theta) = \mathbb{E}_{\tau\sim\pi_\theta}\!\left[R(\tau)\right],
+  \label{eq:reinforce-obj}
+\end{equation}
+donde $\tau = (s_0,a_0,r_0,s_1,a_1,r_1,\dots,s_T,a_T,r_T)$ es una trayectoria seguida por $\pi_\theta$ y $R(\tau)=\sum_{t=0}^{T}\gamma^{t}r_t$ es el retorno descontado.
+
+El teorema del gradiente de política establece que el gradiente de $J(\theta)$ se puede calcular como
+\begin{equation}
+  \nabla_{\theta} J(\theta) = \mathbb{E}_{\tau\sim\pi_\theta}\!\left[\sum_{t=0}^{T-1} \nabla_\theta \log \pi_\theta(a_t|s_t)\, G_t\right],
+\end{equation}
+con $G_t = \sum_{k=t}^{T} \gamma^{k-t} r_k$ el retorno descontado desde el instante $t$. La función de pérdida a minimizar, equivalente al gradiente cambiado de signo, es
+\begin{equation}
+  \mathcal{L}(\theta) \;=\; -\frac{1}{T}\sum_{t=0}^{T-1}\log \pi_\theta(a_t|s_t)\, G_t.
+\end{equation}
+
+Para reducir la varianza del estimador, en nuestra implementación normalizamos los retornos por trayectoria:
+\begin{equation}
+  G'_t = \frac{G_t - \mu_{G_t}}{\sigma_{G_t} + \varepsilon},
+\end{equation}
+con $\mu_{G_t}$ y $\sigma_{G_t}$ la media y desviación típica de los retornos en la trayectoria, y $\varepsilon$ una constante pequeña para evitar la división por cero.
+
+\subsection{Implementación}
+
+La política estocástica del agente se ha modelado mediante una tabla de \emph{logits} de tamaño $|S|\times |A|$ que se transforman en una distribución de probabilidades válida aplicando la función \texttt{softmax}. Esta decisión arquitectónica confiere estabilidad numérica frente a gradientes extremos y permite reutilizar las herramientas tabulares del resto del proyecto.
+
+REINFORCE es un algoritmo Monte Carlo: requiere completar el episodio completo antes de poder actualizar los parámetros, lo cual es coherente con la naturaleza episódica de FrozenLake. Para mitigar la varianza, además de la normalización de retornos, hemos limitado el horizonte mediante \texttt{t\_max=100} pasos.
+
+\subsection{Resultados experimentales}
+
+\paragraph{Curva de aprendizaje.} La Figura~\ref{fig:episodios} mostraba ya la evolución de REINFORCE en función del número de episodios. A diferencia de Q-Learning, REINFORCE sigue mejorando hasta los 20\,000 episodios, sin saturar: pasa de un 6\,\% a 500 episodios a un 46.3\,\% a 20\,000 episodios. Esta tendencia refleja su característica \emph{sample inefficiency}: el estimador del gradiente multiplica la verosimilitud por la ganancia completa del episodio, lo que arrastra toda la varianza de la trayectoria.
+
+\paragraph{Efecto de la estocasticidad.} La Figura~\ref{fig:vi_estoc_4x4_8x8} mostraba que REINFORCE mejora monotónicamente con \texttt{success\_rate}: de 12.7\,\% a \texttt{sr}=0.20 a 62.0\,\% a \texttt{sr}=0.80. Cuando el entorno es más determinista, las trayectorias exitosas se vuelven más informativas (menor varianza del retorno $G_t$ condicionada a alcanzar la meta) y el gradiente apunta más consistentemente hacia la política óptima.
+
+\paragraph{Efecto del learning rate.} La Figura~\ref{fig:rlr} muestra que, en nuestros experimentos, REINFORCE no exhibe una tendencia monotónica clara respecto al \emph{learning rate}, sino que todos los valores producen resultados pobres con alta varianza. Esto es coherente con la naturaleza ruidosa del estimador: ningún \emph{lr} puede compensarlo sin un \emph{baseline} (lo que llevaría a una arquitectura Actor-Critic, fuera del alcance de esta práctica).
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.75\linewidth]{fig_reinforce_lr.png}
+  \caption{REINFORCE: efecto del \emph{learning rate} sobre la tasa de éxito (mapa $4\times 4$, \texttt{sr}=0.33). La varianza inter-seed es muy elevada para todos los valores.}
+  \label{fig:rlr}
+\end{figure}
+
+\paragraph{Efecto del factor de descuento $\gamma$.} En la Figura~\ref{fig:gamma}, REINFORCE también muestra preferencia por valores altos de $\gamma$ (29.8\,\% con $\gamma=0.9$ frente a 46.3\,\% con $\gamma=0.99$), aunque con mucha mayor varianza que Q-Learning. La explicación es la misma: con horizontes largos y recompensa escasa, un $\gamma$ alto preserva la señal positiva al final del episodio.
+
+\paragraph{Efecto del esquema de recompensa.} La Figura~\ref{fig:reward_shaping} mostraba que el \emph{hole penalty} degrada a REINFORCE (de 12.3\,\% a 6.8\,\%) en lugar de ayudarlo. La razón es matemática: ahora las trayectorias completas tienen ganancias $G_t$ negativas grandes en los fallos, lo que aumenta aún más la varianza del gradiente. El \emph{step penalty} es aún peor: hunde a REINFORCE al 4.2\,\% por la combinación de \emph{reward hacking} y varianza explosiva.
+
+\paragraph{Optimalidad de la política.} Como muestra la Figura~\ref{fig:opt_mb}, REINFORCE coincide con la política óptima de VI en un 63--71\,\% de los estados en $4\times 4$, sensiblemente inferior a Q-Learning (85\,\%) y MB (88--96\,\%). Esto refuerza la interpretación: incluso cuando REINFORCE alcanza tasas de éxito decentes, lo hace siguiendo una política subóptima que aprovecha la estocasticidad del entorno más que un camino verdaderamente eficiente. Curiosamente, en $8\times 8$ REINFORCE supera ligeramente a Q-Learning en \emph{agreement} (45.6--45.9\,\% vs.\ 26.9--29.7\,\%) a pesar de tener tasas de éxito similares: la política estocástica de REINFORCE asigna alguna probabilidad a casi todas las acciones, lo que en agregado se parece más a una política uniforme que la política voraz pero mal entrenada de Q-Learning.
+
+\subsection{Análisis del efecto de los parámetros}
+
+\paragraph{Factor de descuento $\gamma$.} REINFORCE muestra preferencia por valores altos de $\gamma$, contrariamente a lo que se observa con frecuencia en otros entornos. Esto se debe a que en FrozenLake la única recompensa significativa es la del estado terminal positivo, y un $\gamma$ alto preserva esa señal a lo largo de la trayectoria.
+
+\paragraph{Tasa de aprendizaje.} En nuestros experimentos no se ha observado una tendencia monotónica clara; valores moderados ($10^{-2}$--$5\!\cdot\!10^{-2}$) ofrecen el mejor compromiso, pero la varianza inter-seed es elevada en todos los casos. Este resultado es coherente con la teoría: el gradiente de policy gradient es intrínsecamente ruidoso, y sin un \emph{baseline} ningún ajuste de $lr$ puede compensarlo del todo.
+
+\paragraph{Esquema de recompensa.} REINFORCE es el algoritmo más vulnerable al \emph{reward shaping}: cualquier modificación que introduzca recompensas negativas degrada el rendimiento al inflar la varianza del gradiente. La recompensa por defecto es claramente preferible.
+
+\paragraph{Número de episodios.} REINFORCE necesita órdenes de magnitud más episodios que Q-Learning para alcanzar tasas de éxito comparables. Esto es esperable dado que requiere múltiples trayectorias completas para reducir la varianza del gradiente.
+
+\subsection{Fortalezas y debilidades}
+
+\paragraph{Fortalezas.}
+\begin{enumerate}
+  \item \textbf{Optimización directa de la política}: no requiere un paso intermedio de estimación de valor.
+  \item \textbf{Aprendizaje de políticas estocásticas}: aprende naturalmente políticas probabilísticas, lo que puede ser beneficioso en entornos parcialmente observables o cuando la exploración continuada es importante.
+  \item \textbf{Aplicabilidad a espacios continuos}: aunque no se aprecia en FrozenLake, el algoritmo se generaliza trivialmente a políticas neuronales sobre espacios de acción continuos.
+  \item \textbf{Mejora monotónica con la determinación del entorno}: cuando la estocasticidad disminuye, REINFORCE consigue acercarse a Q-Learning en tasas de éxito.
+\end{enumerate}
+
+\paragraph{Debilidades.}
+\begin{enumerate}
+  \item \textbf{Varianza intrínseca muy elevada} del estimador del gradiente, que se manifiesta en desviaciones típicas inter-seed de hasta 30 puntos porcentuales.
+  \item \textbf{Sample inefficiency}: requiere muchos más episodios que Q-Learning para alcanzar tasas de éxito comparables.
+  \item \textbf{Sensibilidad fuerte al \emph{reward shaping}}: cualquier recompensa negativa amplifica la varianza.
+  \item \textbf{No es \emph{off-policy}}: necesita ejecutar la política que está aprendiendo, lo que impide reutilizar experiencias.
+  \item \textbf{Optimalidad pobre}: incluso cuando alcanza buenas tasas de éxito, su política está sustancialmente alejada de $\pi^{\ast}$.
+\end{enumerate}
+
+% =====================================================================
+\section{Análisis de escalabilidad}
+% =====================================================================
+
+Una de las preguntas centrales del enunciado es cómo escalan los distintos algoritmos al aumentar el tamaño del mapa. La Figura~\ref{fig:escalabilidad} muestra el rendimiento y el tiempo de entrenamiento sobre mapas de $4\times 4$ a $12\times 12$ generados procedimentalmente con \texttt{sr}=0.33.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.98\linewidth]{fig_escalabilidad.png}
+  \caption{Escalabilidad de los cuatro algoritmos en función del tamaño del mapa (sr=0.33). Izquierda: tasa de éxito. Derecha: tiempo de entrenamiento en escala logarítmica. Value Iteration es el único algoritmo que sobrevive al aumento del tamaño.}
+  \label{fig:escalabilidad}
+\end{figure}
+
+\paragraph{Caída de los métodos \emph{model-free}.} Los métodos basados en experiencia sufren un colapso total a partir de $8\times 8$: la combinación de \emph{sparse reward} (única señal positiva al alcanzar una meta a 14+ pasos) con la exploración $\epsilon$-greedy hace que la probabilidad de tropezar por casualidad con la meta durante el entrenamiento sea ínfima. Mientras eso no ocurre, todas las actualizaciones TD y todos los gradientes de política son nulos o ruido, manteniendo al agente en una caminata aleatoria ciega. Esto coincide con la sexta hipótesis: el colapso de los \emph{model-free} es más temprano que el de los métodos basados en modelo.
+
+\paragraph{Resistencia de Value Iteration.} Value Iteration es el único algoritmo que mantiene tasas de éxito por encima del azar en mapas grandes. La caída del 63\,\% al 15\,\% entre $8\times 8$ y $10\times 10$ no es por fallo del algoritmo, sino por la propia dificultad del MDP: en mapas grandes con \texttt{sr}=0.33 el camino esperado a la meta es muy largo y la probabilidad acumulada de caer en un agujero por resbalones tiende a 1. Incluso la política óptima tiene tasas de éxito limitadas por el propio entorno. Es decir, VI no \emph{falla}, sino que $\pi^{\ast}$ es intrínsecamente insuficiente en estos regímenes.
+
+\paragraph{Trade-off coste vs.\ rendimiento.} La Figura~\ref{fig:tradeoff} cruza el tiempo de entrenamiento con la tasa de éxito y muestra que Value Iteration es \emph{Pareto-dominante} en todos los escenarios: gana en tiempo de cómputo (10--100$\times$ más rápido que los \emph{model-free}) y simultáneamente en tasa de éxito, incluso en mapas pequeños donde los \emph{model-free} deberían ser competitivos.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{fig_tradeoff.png}
+  \caption{Trade-off entre tiempo de entrenamiento (escala logarítmica) y tasa de éxito sobre los cuatro tamaños de mapa (sr=0.33). Value Iteration domina en todos los puntos.}
+  \label{fig:tradeoff}
+\end{figure}
+
+Este resultado ilustra un principio práctico fundamental: \textbf{cuando el MDP es accesible, planificar es estrictamente preferible a aprender por interacción}.
+
+% =====================================================================
+\section{Comparación global y conclusiones}
+% =====================================================================
+
+Tras analizar en profundidad los cuatro algoritmos (Iteración de Valor, Estimación Directa, Q-Learning y REINFORCE) en el entorno \texttt{FrozenLake-v1}, podemos realizar una comparación global de sus rendimientos y verificar las hipótesis iniciales.
+
+\subsection{Verificación de las hipótesis}
+
+\begin{enumerate}
+  \item \textbf{``Los algoritmos basados en modelo convergerán más rápidamente que los basados en experiencia''.} Esta hipótesis se ha confirmado plenamente para Value Iteration, que converge en una fracción del tiempo que necesitan los \emph{model-free}. Para Estimación Directa el resultado es matizado: en mapas pequeños y baja estocasticidad supera a Q-Learning, pero en mapas grandes su dependencia de la cobertura de la exploración aleatoria la hunde tanto como a Q-Learning.
+
+  \item \textbf{``El factor de descuento $\gamma$ tendrá un impacto significativo''.} Esta hipótesis se ha confirmado claramente para los métodos \emph{model-free}: Q-Learning gana 9 puntos al subir $\gamma$ de 0.9 a 0.99, y REINFORCE 16 puntos. Sorprendentemente, en VI el efecto sobre la \emph{política} es mínimo en mapas pequeños, aunque el efecto sobre el \emph{número de iteraciones} es notable (60 vs.\ 228).
+
+  \item \textbf{``Q-Learning mostrará alta sensibilidad a hiperparámetros''.} Confirmada. Los experimentos muestran que Q-Learning es extremadamente sensible a $\epsilon$ y $\alpha$, exhibiendo incluso comportamientos bimodales entre seeds cuando la exploración es insuficiente (Figura~\ref{fig:epsilon}). La diferencia de rendimiento entre la mejor y la peor configuración supera los 50 puntos porcentuales.
+
+  \item \textbf{``REINFORCE requerirá más episodios y exhibirá mayor varianza''.} Plenamente confirmada. REINFORCE no satura ni siquiera con 20\,000 episodios (Figura~\ref{fig:episodios}), y su desviación típica inter-seed es la mayor del estudio. Su optimalidad respecto a $\pi^{\ast}$ es también la más baja.
+
+  \item \textbf{``Los \emph{model-free} colapsarán antes que los basados en modelo al crecer el mapa''.} Confirmada. En $8\times 8$, todos los \emph{model-free} caen al 0--14\,\%, mientras que VI mantiene un 89\,\% para \texttt{sr}=0.6 (Figura~\ref{fig:escalabilidad}).
+
+  \item \textbf{``Al disminuir \texttt{success\_rate}, todos los algoritmos perderán rendimiento de forma monotónica; VI será el más resistente''.} Confirmada. La caída más suave es la de VI (de 100\,\% a 72\,\% al pasar de \texttt{sr}=1.0 a 0.2 en $4\times 4$); REINFORCE es el más afectado (60\,\% a 12.7\,\%).
+\end{enumerate}
+
+\subsection{Tabla resumen del experimento principal}
+
+La Tabla~\ref{tab:summary} sintetiza las medias sobre 5 seeds del experimento principal de estocasticidad.
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{Tasa de éxito media (\%) en evaluación, agregada sobre 5 seeds, para todas las combinaciones de mapa y \texttt{success\_rate} del experimento principal.}
+  \label{tab:summary}
+  \begin{tabular}{lcrrrr}
+    \toprule
+    \textbf{Mapa} & \textbf{sr} & \textbf{VI} & \textbf{MB} & \textbf{QL} & \textbf{REINFORCE} \\
+    \midrule
+    $4\times 4$  & 0.20 &  72.0 & 55.0 & 69.7 & 12.7 \\
+    $4\times 4$  & 0.33 &  73.0 & 58.5 & 68.3 & 12.3 \\
+    $4\times 4$  & 0.60 &  72.9 & 66.8 & 69.4 & 34.3 \\
+    $4\times 4$  & 0.80 &  85.6 & 83.1 & 72.6 & 62.0 \\
+    $4\times 4$  & 1.00 & 100.0 &100.0 & 80.0 & 60.0 \\
+    \midrule
+    $8\times 8$  & 0.20 &  52.8 &  0.0 &  0.0 &  3.9 \\
+    $8\times 8$  & 0.33 &  63.4 &  0.0 &  0.0 &  0.1 \\
+    $8\times 8$  & 0.60 &  89.4 &  9.3 &  0.0 & 13.7 \\
+    $8\times 8$  & 0.80 &  89.3 &  0.0 &  0.0 & 14.6 \\
+    $8\times 8$  & 1.00 & 100.0 &  0.0 &  0.0 &  0.0 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Conclusiones finales}
+
+Del estudio exhaustivo realizado podemos extraer varias conclusiones globales sobre el rendimiento y las características de los cuatro algoritmos:
+
+\paragraph{Tasa de éxito.} Value Iteration es el algoritmo dominante en todos los escenarios, seguido por Estimación Directa cuando la cobertura del muestreo es suficiente, después Q-Learning y finalmente REINFORCE. La jerarquía es estable en $4\times 4$ y se vuelve trivial en $8\times 8$ y mayores, donde sólo VI mantiene un rendimiento significativo.
+
+\paragraph{Eficiencia computacional.} VI es entre 10 y 100 veces más rápido que los \emph{model-free} y escala polinomialmente con $|S|\cdot|A|$. Estimación Directa es muy eficiente \emph{cuando funciona}, pero pierde efectividad en mapas grandes por la pobre cobertura. Q-Learning y REINFORCE escalan linealmente con el número de episodios y de pasos por episodio, lo cual los hace lentos en mapas grandes.
+
+\paragraph{Optimalidad respecto a $\pi^{\ast}$.} En $4\times 4$, Estimación Directa recupera la política óptima en un 88--96\,\% de los estados, Q-Learning en torno al 85\,\% y REINFORCE en torno al 65--71\,\%. En $8\times 8$ todos los métodos \emph{model-free} pierden el control y su \emph{policy agreement} cae por debajo del 50\,\%.
+
+\paragraph{Robustez frente a la estocasticidad.} VI es prácticamente inmune, dado que su política depende sólo de la dinámica conocida. Q-Learning aguanta razonablemente en $4\times 4$ pero se hunde en $8\times 8$. REINFORCE es el más vulnerable: su rendimiento varía de 60\,\% a 12\,\% al pasar de \texttt{sr}=0.8 a \texttt{sr}=0.2.
+
+\paragraph{Robustez frente al tamaño del mapa.} Es la conclusión más importante del estudio. Mientras VI muestra una degradación suave y proporcional al \emph{problema} (no al algoritmo), los métodos \emph{model-free} sufren un colapso abrupto al pasar de $4\times 4$ a $8\times 8$. Este \emph{cliff} se debe a la combinación de \emph{sparse reward} y exploración $\epsilon$-greedy, y representa una limitación fundamental de los métodos tabulares sin información a priori.
+
+\subsection{Recomendaciones prácticas}
+
+A partir de los resultados, extraemos las siguientes recomendaciones para entrenar agentes en FrozenLake (y en MDP estocásticos similares):
+\begin{enumerate}
+  \item \textbf{Si el MDP es accesible, usar Value Iteration}. No existe ningún escenario en el estudio donde un método \emph{model-free} mejore a VI cuando éste tiene acceso al modelo. La inversión en construir o consultar el MDP se amortiza muy rápidamente.
+  \item \textbf{Si el MDP no es accesible pero el espacio de estados es pequeño}, el orden de preferencia es \emph{Model-Based} $\succ$ Q-Learning $\succ$ REINFORCE.
+  \item \textbf{Si el espacio de estados crece}, ningún método tabular puro funcionará bajo \emph{sparse rewards}. Las direcciones a explorar son: introducir aproximadores de función (DQN, redes neuronales), \emph{replay buffers}, arquitecturas Actor-Critic que reduzcan la varianza de REINFORCE, o técnicas de \emph{reward shaping} más sofisticadas como las basadas en \emph{potential functions}.
+  \item \textbf{Calibración de $\epsilon$}: mantener $\epsilon_0 \geq 0.8$ con decaimiento gradual ($d_\epsilon = 0.999$) al menos hasta que la tabla $Q$ tenga cobertura suficiente. Valores bajos producen comportamientos bimodales (o converge o no, dependiendo de la seed).
+  \item \textbf{Calibración de $\alpha$}: $\alpha=0.1$ es el punto dulce en este tipo de tareas tabulares con horizontes moderados. Valores más altos rompen las condiciones de Robbins--Monro y desestabilizan la convergencia.
+  \item \textbf{Calibración de $\gamma$}: $\gamma=0.99$ es preferible en Q-Learning y REINFORCE; en VI el valor es indiferente para la política, pero conviene ajustarlo a $\gamma=0.95$ si se busca minimizar el número de iteraciones internas sin perder calidad.
+  \item \textbf{No modificar la señal de recompensa salvo justificación fuerte}. El \emph{step penalty} hunde el rendimiento; el \emph{hole penalty} solo ayuda marginalmente a Q-Learning y empeora REINFORCE. La recompensa \emph{sparse} por defecto es preferible en la mayoría de los casos.
+  \item \textbf{Sobre la varianza inter-seed}: cualquier conclusión basada en una única seed es estadísticamente cuestionable. Los métodos \emph{model-free} exhiben varianzas inter-seed de hasta $\pm 30$ puntos en algunas configuraciones; sin múltiples seeds es imposible distinguir un resultado real de un artefacto.
+\end{enumerate}
+
+\paragraph{Cierre.} Este estudio muestra la complejidad inherente al aprendizaje por refuerzo y la importancia de escoger el algoritmo adecuado en función de las características del problema. Destaca, además, que a pesar de las diferencias teóricas entre los algoritmos, todos se enfrentan a limitaciones similares cuando la combinación de estocasticidad y \emph{sparse reward} se vuelve agresiva, sugiriendo que la investigación futura debería centrarse en métodos más robustos frente a estos dos factores, ya sea mediante aproximación de funciones, técnicas de reducción de varianza o arquitecturas híbridas modelo-libre/modelo.
+
+% =====================================================================
+\section*{Referencias}
+\addcontentsline{toc}{section}{Referencias}
+% =====================================================================
+
+\begin{enumerate}
+  \item Sutton, R.~S., \& Barto, A.~G. (2018). \textit{Reinforcement Learning: An Introduction} (2nd ed.). MIT Press.
+  \item Williams, R.~J. (1992). Simple statistical gradient-following algorithms for connectionist reinforcement learning. \textit{Machine Learning}, 8(3), 229--256.
+  \item Russell, S., \& Norvig, P. (2020). \textit{Artificial Intelligence: A Modern Approach} (4th ed.). Pearson. Cap. 23.
+  \item Albrecht, S.~V., Christianos, F., \& Schäfer, L. (2024). \textit{Multi-Agent Reinforcement Learning: Foundations and Modern Approaches}. MIT Press. Cap. 2 y 8.
+  \item Material de las sesiones de teoría y laboratorio de SID, Q2 2025--2026. UPC.
+  \item Documentación de Gymnasium, entorno FrozenLake-v1: \url{https://gymnasium.farama.org/environments/toy_text/frozen_lake/}.
+\end{enumerate}
+
+\end{document}

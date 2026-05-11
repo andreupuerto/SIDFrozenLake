@@ -1,34 +1,101 @@
-# config.py aqui las variables para poder cambiar los parametros
-import numpy as np
+# config.py
+# Changes: aligned defaults with the experimental plan (Section 1.1),
+# added seed/budget helpers for reproducible experiments (Section 1.2),
+# and removed the obsolete REWARD_THRESHOLD variable (Section 1.3).
 
-# --- 1. CONFIGURACIÓN DEL ENTORNO ---
-SLIPPERY = True # el mapa resbala
-MAP_NAME = "4x4" # tamaño del mapa (puede ser 8x8)
-SUCCESS_RATE = 0.8 # probabilidad de que la accion se lleve a cabo
-SEED = 99 # semilla fija del mapa para las pruebas
+# --- 1. CONFIGURACION DEL ENTORNO ---
+SLIPPERY = True
+MAP_NAME = "4x4"
+EXPERIMENT_BASE_SUCCESS_RATE = 1 / 3
+SUCCESS_RATE = EXPERIMENT_BASE_SUCCESS_RATE
+SEED = 99
+REWARD_SCHEDULE = (1, 0, 0)
 
-# --- 2. REWARD SHAPING ---
-DEFAULT_REWARD = False
+
+def get_t_max(map_name):
+    """Return the evaluation/training horizon for a FrozenLake map name."""
+    if map_name == "4x4":
+        return 100
+    if map_name == "8x8":
+        return 200
+    try:
+        n = int(str(map_name).split("x")[0])
+        return 4 * n * n
+    except (ValueError, IndexError, TypeError):
+        return 200
+
+
+T_MAX = get_t_max(MAP_NAME)
+
+# --- 2. REWARD SHAPING / REWARD SCHEDULE ---
+# Native Gymnasium reward_schedule is used by main.create_env. These legacy
+# fields are kept as editable defaults for older local scripts.
+DEFAULT_REWARD = True
 HOLE_PENALTY = -0.5
 STEP_PENALTY = 0.0
 GOAL_REWARD = 1.0
 
-# --- 3. HIPERPARÁMETROS GENERALES ---
-GAMMA = 0.99 # factor descuento
-T_MAX = 100 # maximo de pasos por episodio
-NUM_EPISODES = 2000 # numero de pruebas para entrenar al agente
+# --- 3. SEMILLAS ---
+SEEDS_DEFAULT = [42, 123, 7, 256, 999]
+SEEDS_LARGE_MAP = [42, 123, 7]
 
-LEARNING_RATE = 0.1 # tasa de aprendizaje (parametro alfa)
-LR_DECAY = 0.999 # descuento de la tasa de aprendizaje
+# --- 4. HIPERPARAMETROS GENERALES ---
+GAMMA = 0.99
+NUM_EPISODES = 2000
 
-# QLEARNING
-EPSILON = 0.2 # exploracion inicial
-EPSILON_DECAY = 0.995 # descuento epsilon
-EPSILON_MIN = 0.01 # valor minimo exploracion
+LEARNING_RATE = 0.1
+LR_DECAY = 1.0
 
-THETA_CONVERGENCE = 1e-6 # umbral de convergencia diferencia de valor
+# Q-LEARNING
+EPSILON = 1.0
+EPSILON_DECAY = 0.999
+EPSILON_MIN = 0.01
 
-REINFORCE_LR = 0.1 # learning rate del reinforce
+THETA_CONVERGENCE = 1e-6
 
-NUM_EPISODES_TEST = 100 # tests finales que se hacen para comparar los algoritmos
-REWARD_THRESHOLD = 0.9 # umbral para considerar el problema resuelto
+# REINFORCE
+REINFORCE_LR = 0.01
+
+# MODEL-BASED DIRECT ESTIMATION
+NUM_TRANSITIONS_MB = 5000
+PLANNING_STEPS_PER_ITER = 100
+
+# EVALUACION
+NUM_EPISODES_TEST = 1000
+
+# --- 5. GRIDS Y PRESUPUESTOS DE EXPERIMENTACION ---
+CAL_A_GAMMAS = [0.90, 0.95, 0.99]
+CAL_A_BASE_LEARNING_RATE = 0.1
+CAL_A_BASE_EPSILON = 1.0
+CAL_A_BASE_EPSILON_DECAY = 0.999
+CAL_A_BASE_EPSILON_MIN = 0.01
+CAL_A_BASE_LR_DECAY = 1.0
+CAL_A_BASE_REINFORCE_LR = 0.01
+CAL_A_Q_EPISODES = 10000
+CAL_A_REINFORCE_EPISODES = 20000
+CAL_A_NUM_TRANSITIONS_MB = 5000
+CAL_A_THETA_CONVERGENCE = 1e-6
+CAL_B_EPISODE_COUNTS = [500, 1000, 2000, 5000, 10000, 20000]
+CAL_C_REWARD_CONFIGS = {
+    "default": (1, 0, 0),
+    "hole_penalty": (1, -1, 0),
+    "step_penalty": (1, 0, -0.01),
+}
+CAL_D_EPSILONS = [0.3, 0.5, 0.8, 1.0]
+CAL_D_ALPHAS = [0.05, 0.1, 0.3, 0.5]
+CAL_D_ANCHOR_ALPHA = 0.1
+CAL_E_REINFORCE_LRS = [0.001, 0.01, 0.05, 0.1]
+CAL_F_TRANSITION_COUNTS = [1000, 5000, 20000, 100000]
+SCALING_MAPS = ["4x4", "8x8", "10x10", "12x12"]
+STOCHASTICITY_SUCCESS_RATES = [1.0, 0.8, 0.6, 1 / 3, 0.2]
+SANITY_NUM_EPISODES = 5000
+SANITY_DETERMINISTIC_SUCCESS_RATE = 1.0
+SANITY_EPSILON = 1.0
+SANITY_EPSILON_DECAY = 1.0
+SANITY_REINFORCE_LR = 0.05
+SANITY_MB_TRANSITIONS = 50000
+SANITY_SUCCESS_THRESHOLD = 99.0
+SANITY_POLICY_AGREEMENT_THRESHOLD = 90.0
+SANITY_VI_MAX_ITERATIONS = 500
+SANITY_POLICY_THETA_CONVERGENCE = 1e-6
+SANITY_VI_THETA_CONVERGENCE = 1e-8
